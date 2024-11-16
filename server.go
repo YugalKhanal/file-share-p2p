@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/anthdm/foreverstore/p2p"
@@ -42,7 +44,8 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	transport := p2p.NewTCPTransport(tcpOpts)
 
 	opts := FileServerOpts{
-		ListenAddr:        listenAddr,
+		ListenAddr: listenAddr,
+		// ListenAddr:        "localhost:3000",
 		EncKey:            newEncryptionKey(),
 		StorageRoot:       "shared_files",
 		PathTransformFunc: DefaultPathTransformFunc,
@@ -58,6 +61,50 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	}
 	transport.SetOnPeer(server.onPeer)
 	return server
+}
+
+// Fetches the public IP address of the server
+func getPublicIP() (string, error) {
+	resp, err := http.Get("http://checkip.amazonaws.com")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	ip, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(ip)), nil
+}
+
+// Fetches the local IP address of the server
+func getLocalIP() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+			return ipNet.IP.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no local IP found")
+}
+
+// Determines the peer's full address, combining the detected IP with the listening port
+func getPeerAddress(port string) (string, error) {
+	publicIP, err := getPublicIP()
+	if err != nil {
+		localIP, err := getLocalIP()
+		if err != nil {
+			return "", fmt.Errorf("failed to determine peer IP: %v", err)
+		}
+		return fmt.Sprintf("%s:%s", localIP, port), nil
+	}
+	return fmt.Sprintf("%s:%s", publicIP, port), nil
 }
 
 func (s *FileServer) Start() error {
@@ -92,26 +139,30 @@ func (s *FileServer) ShareFile(filePath string) error {
 	if s.opts.TrackerAddr != "" {
 		if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr); err != nil {
 			log.Printf("Failed to announce to tracker: %v", err)
+		} else {
+			log.Printf("Announced file %s to tracker at %s (peer: %s)", fileID, s.opts.TrackerAddr, s.opts.ListenAddr)
 		}
 	}
 
+	fmt.Println("Peer address: ", s.opts.ListenAddr)
+	fmt.Println("Tracker address: ", s.opts.TrackerAddr)
 	log.Printf("File %s shared with ID %s and %d chunks", filePath, fileID, meta.NumChunks)
 	return nil
 }
 
 func (s *FileServer) generateFileID(filePath string) (string, error) {
-    file, err := os.Open(filePath)
-    if err != nil {
-        return "", err
-    }
-    defer file.Close()
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
 
-    hash := sha1.New() // or use sha256.New() for SHA-256
-    if _, err := io.Copy(hash, file); err != nil {
-        return "", err
-    }
+	hash := sha1.New() // or use sha256.New() for SHA-256
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
 
-    return hex.EncodeToString(hash.Sum(nil)), nil
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // func (s *FileServer) DownloadFile(fileID string) error {
@@ -223,7 +274,28 @@ func (s *FileServer) bootstrapNetwork() {
 }
 
 // announceToTracker sends a request to the tracker to announce this peer's file availability.
-func announceToTracker(trackerAddr, fileID, peerAddr string) error {
+// func announceToTracker(trackerAddr, fileID, peerAddr string) error {
+// 	url := fmt.Sprintf("%s/announce?file_id=%s&peer_addr=%s", trackerAddr, fileID, peerAddr)
+// 	log.Printf("Announcing file %s to tracker at %s (peer: %s)", fileID, trackerAddr, peerAddr) // Debug log
+// 	resp, err := http.Get(url)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer resp.Body.Close()
+//
+// 	if resp.StatusCode != http.StatusOK {
+// 		return fmt.Errorf("failed to announce to tracker, status code: %d", resp.StatusCode)
+// 	}
+// 	return nil
+// }
+
+func announceToTracker(trackerAddr, fileID, listenAddr string) error {
+	// Use dynamic detection for the peer address
+	peerAddr, err := getPeerAddress(listenAddr[1:]) // Strip the leading ":" in ":3000"
+	if err != nil {
+		return fmt.Errorf("failed to determine peer address: %v", err)
+	}
+
 	url := fmt.Sprintf("%s/announce?file_id=%s&peer_addr=%s", trackerAddr, fileID, peerAddr)
 	resp, err := http.Get(url)
 	if err != nil {

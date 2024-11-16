@@ -4,50 +4,215 @@ import (
 	// "encoding/gob"
 	"flag"
 	"fmt"
+	"github.com/anthdm/foreverstore/p2p"
 	"log"
 	"time"
-
-	// "github.com/anthdm/foreverstore/p2p"
 )
 
+// func main() {
+//
+// 	listenAddr := flag.String("listen", ":3000", "server listen address")
+// 	trackerAddr := flag.String("tracker", "", "tracker address (optional)")
+// 	bootstrapNode := flag.String("bootstrap", "", "bootstrap node address (optional)")
+// 	filePath := flag.String("file", "", "file path to share")
+// 	downloadFileID := flag.String("download", "", "file ID to download")
+// 	flag.Parse()
+//
+// 	tracker := p2p.NewTracker()
+// 	go tracker.StartTracker(":8080") // Tracker listens on port 8080
+// 	server := makeServer(*listenAddr, *bootstrapNode)
+// 	if *trackerAddr != "" {
+// 		server.SetTrackerAddress(*trackerAddr)
+// 	}
+//
+// 	go func() {
+// 		if err := server.Start(); err != nil {
+// 			log.Fatalf("server error: %v", err)
+// 		}
+// 	}()
+//
+// 	time.Sleep(1 * time.Second)
+//
+// 	// Share file if filePath is provided
+// 	if *filePath != "" {
+// 		err := server.ShareFile(*filePath)
+// 		if err != nil {
+// 			log.Fatalf("file sharing error: %v", err)
+// 		}
+// 	}
+//
+// 	// Download file if downloadFileID is provided
+// 	if *downloadFileID != "" {
+// 		err := server.DownloadFile(*downloadFileID)
+// 		if err != nil {
+// 			log.Fatalf("file download error: %v", err)
+// 		} else {
+// 			fmt.Printf("Successfully downloaded file with ID %s\n", *downloadFileID)
+// 		}
+// 	}
+//
+// 	select {} // Keep the server running
+// }
+
+// func main() {
+// 	listenAddr := flag.String("listen", ":3000", "server listen address")
+// 	trackerAddr := flag.String("tracker", "", "tracker address (optional)")
+// 	bootstrapNode := flag.String("bootstrap", "", "bootstrap node address (optional)")
+// 	filePath := flag.String("file", "", "file path to share")
+// 	downloadFileID := flag.String("download", "", "file ID to download")
+// 	flag.Parse()
+//
+// 	tracker := p2p.NewTracker()
+// 	go tracker.StartTracker(":8080") // Tracker listens on port 8080
+//
+// 	server := makeServer(*listenAddr, *bootstrapNode)
+// 	if *trackerAddr != "" {
+// 		server.SetTrackerAddress(*trackerAddr)
+// 	}
+//
+// 	go func() {
+// 		if err := server.Start(); err != nil {
+// 			log.Fatalf("server error: %v", err)
+// 		}
+// 	}()
+//
+// 	time.Sleep(1 * time.Second)
+//
+// 	// Share file if filePath is provided
+// 	if *filePath != "" {
+// 		err := server.ShareFile(*filePath)
+// 		if err != nil {
+// 			log.Fatalf("file sharing error: %v", err)
+// 		}
+// 	}
+//
+// 	// Download file if downloadFileID is provided
+// 	if *downloadFileID != "" {
+// 		err := server.DownloadFile(*downloadFileID)
+// 		if err != nil {
+// 			log.Fatalf("file download error: %v", err)
+// 		} else {
+// 			fmt.Printf("Successfully downloaded file with ID %s\n", *downloadFileID)
+// 		}
+// 	}
+//
+// 	select {} // Keep the server running
+// }
+
+// func main() {
+// 	// Parse command-line arguments
+// 	listenAddr := flag.String("listen", ":3000", "server listen address")
+// 	trackerAddr := flag.String("tracker", "", "tracker address (optional)")
+// 	bootstrapNode := flag.String("bootstrap", "", "bootstrap node address (optional)")
+// 	filePath := flag.String("file", "", "file path to share")
+// 	downloadFileID := flag.String("download", "", "file ID to download")
+//
+//
+// 	flag.Parse()
+//
+// 	// Check that required arguments are parsed correctly
+// 	if *trackerAddr == "" {
+// 		log.Fatal("Tracker address is required. Use -tracker=<tracker_address>")
+// 	}
+//
+// 	if *listenAddr == "" {
+// 		log.Fatal("Listen address is required. Use -listen=<listen_address>")
+// 	}
+//
+// 	// Initialize tracker
+// 	tracker := p2p.NewTracker()
+// 	go tracker.StartTracker(":8080") // Tracker listens on port 8080
+//
+// 	// Start server
+// 	server := makeServer(*listenAddr, *bootstrapNode)
+// 	if *trackerAddr != "" {
+// 		server.SetTrackerAddress(*trackerAddr)
+// 	}
+// 	// server.SetTrackerAddress(*trackerAddr)
+//
+// 	go func() {
+// 		if err := server.Start(); err != nil {
+// 			log.Fatalf("server error: %v", err)
+// 		}
+// 	}()
+//
+// 	time.Sleep(1 * time.Second)
+//
+// 	// Share file if filePath is provided
+// 	if *filePath != "" {
+// 		err := server.ShareFile(*filePath)
+// 		if err != nil {
+// 			log.Fatalf("file sharing error: %v", err)
+// 		}
+// 	}
+//
+// 	// Download file if downloadFileID is provided
+// 	if *downloadFileID != "" {
+// 		err := server.DownloadFile(*downloadFileID)
+// 		if err != nil {
+// 			log.Fatalf("file download error: %v", err)
+// 		} else {
+// 			fmt.Printf("Successfully downloaded file with ID %s\n", *downloadFileID)
+// 		}
+// 	}
+//
+// 	select {} // Keep the server running
+// }
+
+
 func main() {
-	listenAddr := flag.String("listen", ":3000", "server listen address")
-	trackerAddr := flag.String("tracker", "", "tracker address (optional)")
-	bootstrapNode := flag.String("bootstrap", "", "bootstrap node address (optional)")
-	filePath := flag.String("file", "", "file path to share")
-	downloadFileID := flag.String("download", "", "file ID to download")
-	flag.Parse()
+    // Parse command-line arguments
+    listenAddr := flag.String("listen", ":3000", "server listen address")
+    trackerAddr := flag.String("tracker", "", "tracker address (optional)")
+    bootstrapNode := flag.String("bootstrap", "", "bootstrap node address (optional)")
+    filePath := flag.String("file", "", "file path to share")
+    downloadFileID := flag.String("download", "", "file ID to download")
+    startTracker := flag.Bool("start-tracker", false, "start a tracker server")
 
-	server := makeServer(*listenAddr, *bootstrapNode)
-	if *trackerAddr != "" {
-		server.SetTrackerAddress(*trackerAddr)
-	}
+    flag.Parse()
 
-	go func() {
-		if err := server.Start(); err != nil {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
+    // Start the tracker if requested
+    if *startTracker {
+        tracker := p2p.NewTracker()
+        log.Printf("Starting tracker on %s", *listenAddr)
+        tracker.StartTracker(*listenAddr)
+        return // Exit after starting the tracker
+    }
 
-	time.Sleep(1 * time.Second)
+    // Ensure tracker address is provided for peers
+    if *trackerAddr == "" {
+        log.Fatal("Tracker address is required. Use -tracker=<tracker_address>")
+    }
 
-	// Share file if filePath is provided
-	if *filePath != "" {
-		err := server.ShareFile(*filePath)
-		if err != nil {
-			log.Fatalf("file sharing error: %v", err)
-		}
-	}
+    // Initialize and start the file server
+    server := makeServer(*listenAddr, *bootstrapNode)
+    server.SetTrackerAddress(*trackerAddr)
 
-	// Download file if downloadFileID is provided
-	if *downloadFileID != "" {
-		err := server.DownloadFile(*downloadFileID)
-		if err != nil {
-			log.Fatalf("file download error: %v", err)
-		} else {
-			fmt.Printf("Successfully downloaded file with ID %s\n", *downloadFileID)
-		}
-	}
+    go func() {
+        if err := server.Start(); err != nil {
+            log.Fatalf("server error: %v", err)
+        }
+    }()
 
-	select {} // Keep the server running
+    time.Sleep(1 * time.Second)
+
+    // Share file if filePath is provided
+    if *filePath != "" {
+        err := server.ShareFile(*filePath)
+        if err != nil {
+            log.Fatalf("file sharing error: %v", err)
+        }
+    }
+
+    // Download file if downloadFileID is provided
+    if *downloadFileID != "" {
+        err := server.DownloadFile(*downloadFileID)
+        if err != nil {
+            log.Fatalf("file download error: %v", err)
+        } else {
+            fmt.Printf("Successfully downloaded file with ID %s\n", *downloadFileID)
+        }
+    }
+
+    select {} // Keep the server running
 }
