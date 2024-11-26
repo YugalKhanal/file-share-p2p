@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/anthdm/foreverstore/p2p"
+	// "github.com/anthdm/foreverstore/shared"
 )
 
 type FileServerOpts struct {
@@ -165,54 +166,53 @@ func (s *FileServer) generateFileID(filePath string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-// func (s *FileServer) DownloadFile(fileID string) error {
-// 	log.Printf("Attempting to download file with ID: %s", fileID)
-//
-// 	meta, err := s.store.GetMetadata(fileID)
-// 	if err != nil {
-// 		return fmt.Errorf("metadata not found for file ID %s: %v", fileID, err)
-// 	}
-//
-// 	for chunk := 0; chunk < meta.NumChunks; chunk++ {
-// 		var downloaded bool
-//
-// 		for _, peer := range s.peers {
-// 			// Create request message and serialize it to []byte
-// 			req := p2p.MessageChunkRequest{
-// 				FileID: fileID,
-// 				Chunk:  chunk,
-// 			}
-//
-// 			var buf bytes.Buffer
-// 			enc := gob.NewEncoder(&buf)
-// 			if err := enc.Encode(req); err != nil {
-// 				log.Printf("Failed to encode request: %v", err)
-// 				continue
-// 			}
-//
-// 			// Send serialized request
-// 			if err := peer.Send(buf.Bytes()); err == nil {
-// 				log.Printf("Requested chunk %d from peer %s", chunk, peer.RemoteAddr())
-// 				downloaded = true
-// 				break
-// 			}
-// 		}
-//
-// 		if !downloaded {
-// 			return fmt.Errorf("failed to download chunk %d for file %s", chunk, fileID)
-// 		}
-// 	}
-//
-// 	log.Printf("File with ID %s successfully downloaded", fileID)
-// 	return nil
-// }
-
 func (s *FileServer) DownloadFile(fileID string) error {
 	log.Printf("Attempting to download file with ID: %s", fileID)
 
+	// Check if metadata is available locally
 	meta, err := s.store.GetMetadata(fileID)
 	if err != nil {
-		return fmt.Errorf("metadata not found for file ID %s: %v", fileID, err)
+		log.Printf("Metadata not found locally for file ID %s. Attempting to fetch from peers...", fileID)
+
+		// Attempt to fetch metadata from peers
+		for _, peer := range s.peers {
+			log.Printf("Requesting metadata from peer %s", peer.RemoteAddr())
+
+			req := p2p.MessageMetadataRequest{FileID: fileID}
+			var buf bytes.Buffer
+			enc := gob.NewEncoder(&buf)
+			if err := enc.Encode(req); err != nil {
+				log.Printf("Failed to encode metadata request: %v", err)
+				continue
+			}
+
+			if err := peer.Send(buf.Bytes()); err != nil {
+				log.Printf("Failed to send metadata request to peer %s: %v", peer.RemoteAddr(), err)
+				continue
+			}
+
+			// Read the response
+			var resp p2p.MessageMetadataResponse
+			dec := gob.NewDecoder(peer)
+			if err := dec.Decode(&resp); err != nil {
+				log.Printf("Failed to decode metadata response from peer %s: %v", peer.RemoteAddr(), err)
+				continue
+			}
+
+			// Save the received metadata locally
+			if err := s.store.saveMetadata(&resp.Metadata); err != nil {
+				log.Printf("Failed to save received metadata: %v", err)
+				continue
+			}
+
+			log.Printf("Successfully fetched metadata for file ID %s from peer %s", fileID, peer.RemoteAddr())
+			meta = &resp.Metadata
+			break
+		}
+
+		if meta == nil {
+			return fmt.Errorf("failed to fetch metadata for file ID %s from peers", fileID)
+		}
 	}
 
 	// Construct the output file name with the correct extension
@@ -236,12 +236,25 @@ func (s *FileServer) DownloadFile(fileID string) error {
 			var buf bytes.Buffer
 			enc := gob.NewEncoder(&buf)
 			if err := enc.Encode(req); err != nil {
-				log.Printf("Failed to encode request: %v", err)
+				log.Printf("Failed to encode chunk request: %v", err)
 				continue
 			}
 
 			if err := peer.Send(buf.Bytes()); err == nil {
 				log.Printf("Requested chunk %d from peer %s", chunk, peer.RemoteAddr())
+
+				// Read the chunk data
+				chunkData := make([]byte, meta.ChunkSize)
+				if _, err := io.ReadFull(peer, chunkData); err != nil {
+					log.Printf("Failed to read chunk %d data from peer %s: %v", chunk, peer.RemoteAddr(), err)
+					continue
+				}
+
+				// Write the chunk to the output file
+				if _, err := outputFile.Write(chunkData); err != nil {
+					return fmt.Errorf("failed to write chunk %d to file: %v", chunk, err)
+				}
+
 				downloaded = true
 				break
 			}
@@ -253,6 +266,54 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	}
 
 	log.Printf("File with ID %s successfully downloaded and saved as %s", fileID, outputFileName)
+	return nil
+}
+
+func (s *FileServer) handleMessage(peer p2p.Peer, msg *p2p.Message) error {
+	switch msg.Type {
+	case "chunk_request":
+		payload, ok := msg.Payload.(p2p.MessageChunkRequest)
+		if !ok {
+			return fmt.Errorf("invalid payload type for chunk_request")
+		}
+		return s.handleChunkRequest(peer, payload)
+	case "metadata_request":
+		payload, ok := msg.Payload.(p2p.MessageMetadataRequest)
+		if !ok {
+			return fmt.Errorf("invalid payload type for metadata_request")
+		}
+		return s.handleMetadataRequest(peer, payload)
+	default:
+		log.Printf("Received unknown message type %s from %s", msg.Type, peer.RemoteAddr())
+		return nil
+	}
+}
+
+func (s *FileServer) handleMetadataRequest(peer p2p.Peer, req p2p.MessageMetadataRequest) error {
+	log.Printf("Received metadata request for file ID %s from peer %s", req.FileID, peer.RemoteAddr())
+
+	// Load metadata
+	meta, err := s.store.GetMetadata(req.FileID)
+	if err != nil {
+		log.Printf("Metadata not found for file ID %s: %v", req.FileID, err)
+		return err
+	}
+
+	// Send metadata back to the requesting peer
+	resp := p2p.MessageMetadataResponse{Metadata: *meta}
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(resp); err != nil {
+		log.Printf("Failed to encode metadata response: %v", err)
+		return err
+	}
+
+	if _, err := peer.Write(buf.Bytes()); err != nil {
+		log.Printf("Failed to send metadata response to peer %s: %v", peer.RemoteAddr(), err)
+		return err
+	}
+
+	log.Printf("Sent metadata for file ID %s to peer %s", req.FileID, peer.RemoteAddr())
 	return nil
 }
 
@@ -274,21 +335,6 @@ func (s *FileServer) bootstrapNetwork() {
 }
 
 // announceToTracker sends a request to the tracker to announce this peer's file availability.
-// func announceToTracker(trackerAddr, fileID, peerAddr string) error {
-// 	url := fmt.Sprintf("%s/announce?file_id=%s&peer_addr=%s", trackerAddr, fileID, peerAddr)
-// 	log.Printf("Announcing file %s to tracker at %s (peer: %s)", fileID, trackerAddr, peerAddr) // Debug log
-// 	resp, err := http.Get(url)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer resp.Body.Close()
-//
-// 	if resp.StatusCode != http.StatusOK {
-// 		return fmt.Errorf("failed to announce to tracker, status code: %d", resp.StatusCode)
-// 	}
-// 	return nil
-// }
-
 func announceToTracker(trackerAddr, fileID, listenAddr string) error {
 	// Use dynamic detection for the peer address
 	peerAddr, err := getPeerAddress(listenAddr[1:]) // Strip the leading ":" in ":3000"
