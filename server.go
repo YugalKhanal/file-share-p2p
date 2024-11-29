@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/gob"
 	"encoding/hex"
+	// "encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -171,6 +172,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 	// Check if metadata is available locally
 	meta, err := s.store.GetMetadata(fileID)
+	fmt.Println("got metadata", meta)
 	if err != nil {
 		log.Printf("Metadata not found locally for file ID %s. Attempting to fetch from peers...", fileID)
 
@@ -226,6 +228,9 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	// Loop through each chunk to download and write to the output file
 	for chunk := 0; chunk < meta.NumChunks; chunk++ {
 		var downloaded bool
+
+		// doesnt enter the below loop for some reason because there's no peers in the map
+		fmt.Println("list of peers", s.peers)
 
 		for _, peer := range s.peers {
 			req := p2p.MessageChunkRequest{

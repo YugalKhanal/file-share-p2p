@@ -130,7 +130,7 @@ func (s *Store) ChunkAndStore(fileID, filePath string) (*shared.Metadata, error)
 
 		// Define the chunk file name based on the file ID and chunk index
 		chunkFileName := fmt.Sprintf("%s_chunk_%d", fileID, chunkIndex)
-		if _, err := s.writeChunk(fileID, chunkFileName, buf[:n]); err != nil {
+		if _, err := s.writeChunk(fileID, chunkFileName, fileExtension, buf[:n]); err != nil {
 			return nil, fmt.Errorf("failed to write chunk: %v", err)
 		}
 		chunkIndex++
@@ -189,12 +189,12 @@ func (s *Store) GetMetadata(fileID string) (*shared.Metadata, error) {
 }
 
 // writeChunk saves a chunk of data to a file in the store directory
-func (s *Store) writeChunk(id, name string, data []byte) (int, error) {
+func (s *Store) writeChunk(id, name, ext string, data []byte) (int, error) {
 	dir := fmt.Sprintf("%s/%s", s.opts.Root, id)
 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
 		return 0, err
 	}
-	f, err := os.Create(fmt.Sprintf("%s/%s", dir, name))
+	f, err := os.Create(fmt.Sprintf("%s/%s.%s", dir, name, ext))
 	if err != nil {
 		return 0, err
 	}
