@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/anthdm/foreverstore/p2p"
 	"github.com/anthdm/foreverstore/shared"
@@ -68,37 +69,49 @@ func NewStore(opts StoreOpts) *Store {
 
 // handleChunkRequest reads a chunk file from disk and sends it to the requesting peer.
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
-	log.Printf("Received chunk request for file ID %s, chunk %d from peer %s", req.FileID, req.Chunk, peer.RemoteAddr())
+	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
 
-	chunkPath := fmt.Sprintf("%s/%s/%s_chunk_%d", s.opts.StorageRoot, req.FileID, req.FileID, req.Chunk)
-	chunkFile, err := os.Open(chunkPath)
+	meta, err := s.store.GetMetadata(req.FileID)
 	if err != nil {
-		return fmt.Errorf("failed to open chunk file: %v", err)
-	}
-	defer chunkFile.Close()
-
-	chunkData, err := io.ReadAll(chunkFile)
-	if err != nil {
-		return fmt.Errorf("failed to read chunk data: %v", err)
+		log.Printf("Error getting metadata: %v", err)
+		return err
 	}
 
-	resp := p2p.MessageChunkResponse{
-		FileID: req.FileID,
-		Chunk:  req.Chunk,
-		Data:   chunkData,
+	chunkPath := fmt.Sprintf("%s/%s/%s_chunk_%d%s",
+		s.opts.StorageRoot, req.FileID, req.FileID, req.Chunk, meta.FileExtension)
+	log.Printf("Looking for chunk at: %s", chunkPath)
+
+	chunkData, err := os.ReadFile(chunkPath)
+	if err != nil {
+		log.Printf("Error reading chunk file: %v", err)
+		return err
+	}
+
+	log.Printf("Read %d bytes from chunk file", len(chunkData))
+
+	// Create response with the chunk data
+	msg := p2p.Message{
+		Type: "chunk_response",
+		Payload: p2p.MessageChunkResponse{
+			FileID: req.FileID,
+			Chunk:  req.Chunk,
+			Data:   chunkData,
+		},
 	}
 
 	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(resp); err != nil {
-		return fmt.Errorf("failed to encode chunk response: %v", err)
+	if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
+		log.Printf("Error encoding response: %v", err)
+		return err
 	}
 
+	log.Printf("Sending response of size %d bytes", buf.Len())
 	if _, err := peer.Write(buf.Bytes()); err != nil {
-		return fmt.Errorf("failed to send chunk response: %v", err)
+		log.Printf("Error sending response: %v", err)
+		return err
 	}
 
-	log.Printf("Sent chunk %d of file %s to peer %s", req.Chunk, req.FileID, peer.RemoteAddr())
+	log.Printf("Successfully sent chunk response")
 	return nil
 }
 
@@ -194,7 +207,10 @@ func (s *Store) writeChunk(id, name, ext string, data []byte) (int, error) {
 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
 		return 0, err
 	}
-	f, err := os.Create(fmt.Sprintf("%s/%s.%s", dir, name, ext))
+	// Make sure we only have one dot before the extension
+	name = strings.TrimSuffix(name, ".")
+	filePath := fmt.Sprintf("%s/%s%s", dir, name, ext)
+	f, err := os.Create(filePath)
 	if err != nil {
 		return 0, err
 	}

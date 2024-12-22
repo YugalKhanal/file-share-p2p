@@ -45,62 +45,6 @@ func (t *Tracker) StartTracker(address string) {
 
 // handleAnnounce handles peers announcing the files they have
 // Endpoint: /announce?file_id=<fileID>&peer_addr=<peerAddr>
-// func (t *Tracker) handleAnnounce(w http.ResponseWriter, r *http.Request) {
-// 	fileID := r.URL.Query().Get("file_id")
-// 	peerAddr := r.URL.Query().Get("peer_addr")
-//
-// 	if fileID == "" || peerAddr == "" {
-// 		http.Error(w, "file_id and peer_addr are required", http.StatusBadRequest)
-// 		return
-// 	}
-//
-// 	t.mu.Lock()
-// 	defer t.mu.Unlock()
-//
-// 	// Add the peer to the list of peers for this fileID
-// 	if _, exists := t.fileIndex[fileID]; !exists {
-// 		t.fileIndex[fileID] = make(map[string]bool)
-// 	}
-// 	t.fileIndex[fileID][peerAddr] = true
-//
-// 	log.Printf("Announced file %s from peer %s", fileID, peerAddr)
-// 	w.WriteHeader(http.StatusOK)
-// 	fmt.Fprintf(w, "Announced file %s from peer %s\n", fileID, peerAddr)
-// }
-//
-// // handleGetPeers retrieves peers sharing a specific file
-// // Endpoint: /peers?file_id=<fileID>
-// func (t *Tracker) handleGetPeers(w http.ResponseWriter, r *http.Request) {
-// 	fileID := r.URL.Query().Get("file_id")
-//
-// 	if fileID == "" {
-// 		http.Error(w, "file_id is required", http.StatusBadRequest)
-// 		return
-// 	}
-//
-// 	t.mu.Lock()
-// 	defer t.mu.Unlock()
-//
-// 	// Get the list of peers for this fileID
-// 	peers, exists := t.fileIndex[fileID]
-// 	if !exists {
-// 		http.Error(w, "No peers found for this file", http.StatusNotFound)
-// 		return
-// 	}
-//
-// 	// Convert the peer map to a list for easier JSON encoding
-// 	peerList := make([]string, 0, len(peers))
-// 	for peer := range peers {
-// 		peerList = append(peerList, peer)
-// 	}
-//
-// 	// Send the list of peers as a JSON response
-// 	w.Header().Set("Content-Type", "application/json")
-// 	if err := json.NewEncoder(w).Encode(peerList); err != nil {
-// 		http.Error(w, "Failed to encode peer list", http.StatusInternalServerError)
-// 	}
-// }
-
 func (t *Tracker) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 	fileID := r.URL.Query().Get("file_id")
 	peerAddr := r.URL.Query().Get("peer_addr")
