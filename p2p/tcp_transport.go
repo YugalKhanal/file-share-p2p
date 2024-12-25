@@ -3,6 +3,7 @@ package p2p
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -116,44 +117,83 @@ func (t *TCPTransport) startAcceptLoop() {
 	}
 }
 
+// In tcp_transport.go
+// In tcp_transport.go
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	var err error
 
+	// Set up defer for connection cleanup
 	defer func() {
-		fmt.Printf("dropping peer connection: %s", err)
+		// Log connection closure with any associated error
+		if err != nil {
+			log.Printf("Closing connection to %s due to error: %v",
+				conn.RemoteAddr(), err)
+		} else {
+			log.Printf("Closing connection to %s (normal shutdown)",
+				conn.RemoteAddr())
+		}
 		conn.Close()
 	}()
 
+	// Create and initialize peer
 	peer := NewTCPPeer(conn, outbound)
+	log.Printf("New peer connection established: remote=%s outbound=%v",
+		conn.RemoteAddr(), outbound)
 
+	// Perform handshake
 	if err = t.HandshakeFunc(peer); err != nil {
+		log.Printf("Handshake failed with peer %s: %v",
+			conn.RemoteAddr(), err)
 		return
 	}
+	log.Printf("Handshake completed successfully with peer %s",
+		conn.RemoteAddr())
 
+	// Notify about new peer if callback is set
 	if t.OnPeer != nil {
 		if err = t.OnPeer(peer); err != nil {
+			log.Printf("OnPeer callback failed for %s: %v",
+				conn.RemoteAddr(), err)
 			return
 		}
+		log.Printf("OnPeer callback completed successfully for %s",
+			conn.RemoteAddr())
 	}
 
-	// Read loop
+	// Start the main message reading loop
 	for {
+		// Create a new RPC message container
 		rpc := RPC{}
+		log.Printf("Reading new message from peer %s", conn.RemoteAddr())
+
+		// Attempt to decode the incoming message
 		err = t.Decoder.Decode(conn, &rpc)
 		if err != nil {
+			if err == io.EOF {
+				log.Printf("Connection closed by peer %s", conn.RemoteAddr())
+			} else {
+				log.Printf("Error decoding message from %s: %v",
+					conn.RemoteAddr(), err)
+			}
 			return
 		}
 
+		// Log successful message decode
+		log.Printf("Successfully decoded message from %s: StreamFlag=%v PayloadSize=%d",
+			conn.RemoteAddr(), rpc.Stream, len(rpc.Payload))
+
+		// Set message source
 		rpc.From = conn.RemoteAddr().String()
 
-		if rpc.Stream {
-			peer.wg.Add(1)
-			fmt.Printf("[%s] incoming stream, waiting...\n", conn.RemoteAddr())
-			peer.wg.Wait()
-			fmt.Printf("[%s] stream closed, resuming read loop\n", conn.RemoteAddr())
-			continue
+		// Try to send the message through the RPC channel
+		select {
+		case t.rpcch <- rpc:
+			log.Printf("Successfully forwarded message from %s to RPC channel",
+				conn.RemoteAddr())
+		default:
+			// Channel is full, log warning and drop message
+			log.Printf("Warning: RPC channel full, dropping message from %s",
+				conn.RemoteAddr())
 		}
-
-		t.rpcch <- rpc
 	}
 }
