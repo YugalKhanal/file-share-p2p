@@ -7,15 +7,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/anthdm/foreverstore/p2p"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthdm/foreverstore/p2p"
+	"github.com/anthdm/foreverstore/shared"
 	// "github.com/anthdm/foreverstore/shared"
 )
 
@@ -413,28 +416,43 @@ func (s *FileServer) onPeer(peer p2p.Peer) error {
 }
 
 func (s *FileServer) ShareFile(filePath string) error {
-	// fileID := generateID()
 	fileID, err := s.generateFileID(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to generate file ID: %v", err)
 	}
 
-	meta, err := s.store.ChunkAndStore(fileID, filePath)
+	file, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %v", err)
+	}
+
+	numChunks := int((fileInfo.Size() + int64(ChunkSize) - 1) / int64(ChunkSize))
+
+	meta := &shared.Metadata{
+		FileID:        fileID,
+		NumChunks:     numChunks,
+		FileExtension: filepath.Ext(filePath),
+		ChunkSize:     ChunkSize,
+		OriginalPath:  filePath, // Add this
+	}
+
+	if err := s.store.saveMetadata(meta); err != nil {
+		return fmt.Errorf("failed to save metadata: %v", err)
 	}
 
 	if s.opts.TrackerAddr != "" {
 		if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr); err != nil {
 			log.Printf("Failed to announce to tracker: %v", err)
-		} else {
-			log.Printf("Announced file %s to tracker at %s (peer: %s)", fileID, s.opts.TrackerAddr, s.opts.ListenAddr)
 		}
 	}
 
-	fmt.Println("Peer address: ", s.opts.ListenAddr)
-	fmt.Println("Tracker address: ", s.opts.TrackerAddr)
-	log.Printf("File %s shared with ID %s and %d chunks", filePath, fileID, meta.NumChunks)
+	log.Printf("File %s shared with ID %s and %d chunks", filePath, fileID, numChunks)
 	return nil
 }
 

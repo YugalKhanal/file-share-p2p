@@ -77,19 +77,16 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return err
 	}
 
-	chunkPath := fmt.Sprintf("%s/%s/%s_chunk_%d%s",
-		s.opts.StorageRoot, req.FileID, req.FileID, req.Chunk, meta.FileExtension)
-	log.Printf("Looking for chunk at: %s", chunkPath)
+	// Read the chunk directly from the original file
+	// filePath := fmt.Sprintf("example.txt") // You'll need to store the original file path in metadata
+	filePath := meta.OriginalPath // You'll need to store the original file path in metadata
 
-	chunkData, err := os.ReadFile(chunkPath)
+	chunkData, err := s.store.ReadChunk(filePath, req.Chunk)
 	if err != nil {
-		log.Printf("Error reading chunk file: %v", err)
+		log.Printf("Error reading chunk: %v", err)
 		return err
 	}
 
-	log.Printf("Read %d bytes from chunk file", len(chunkData))
-
-	// Create response with the chunk data
 	msg := p2p.Message{
 		Type: "chunk_response",
 		Payload: p2p.MessageChunkResponse{
@@ -105,14 +102,36 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return err
 	}
 
-	log.Printf("Sending response of size %d bytes", buf.Len())
-	if _, err := peer.Write(buf.Bytes()); err != nil {
+	if err := peer.Send(buf.Bytes()); err != nil {
 		log.Printf("Error sending response: %v", err)
 		return err
 	}
 
-	log.Printf("Successfully sent chunk response")
 	return nil
+}
+
+func (s *Store) ReadChunk(filePath string, chunkIndex int) ([]byte, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	// Seek to the correct chunk position
+	offset := int64(chunkIndex * ChunkSize)
+	_, err = file.Seek(offset, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to seek to chunk: %v", err)
+	}
+
+	// Read the chunk
+	buf := make([]byte, ChunkSize)
+	n, err := file.Read(buf)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read chunk: %v", err)
+	}
+
+	return buf[:n], nil
 }
 
 // ChunkAndStore divides a file into chunks, stores each chunk,

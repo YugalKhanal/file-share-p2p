@@ -7,6 +7,7 @@ type Metadata struct {
 	NumChunks     int
 	FileExtension string
 	ChunkSize     int
+	OriginalPath  string
 }
 
 func (m *Metadata) FullPath(basePath string) string {
