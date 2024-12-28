@@ -5,9 +5,12 @@ import "path/filepath"
 type Metadata struct {
 	FileID        string
 	NumChunks     int
-	FileExtension string
 	ChunkSize     int
+	FileExtension string
 	OriginalPath  string
+	ChunkHashes   []string
+	TotalHash     string
+	TotalSize     int64
 }
 
 func (m *Metadata) FullPath(basePath string) string {

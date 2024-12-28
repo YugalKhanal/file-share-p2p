@@ -121,18 +121,6 @@ func getPeerAddress(port string) (string, error) {
 	return fmt.Sprintf("localhost:%s", port), nil
 }
 
-func normalizeAddress(addr string) string {
-	// Handle IPv6 localhost address
-	if strings.HasPrefix(addr, "[::1]:") {
-		portIndex := strings.LastIndex(addr, ":")
-		if portIndex > 0 {
-			port := addr[portIndex+1:]
-			return fmt.Sprintf("localhost:%s", port)
-		}
-	}
-	return addr
-}
-
 // New function to refresh peer list from tracker
 func (s *FileServer) refreshPeers(fileID string) error {
 	url := fmt.Sprintf("%s/peers?file_id=%s", s.opts.TrackerAddr, fileID)
@@ -160,6 +148,7 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	// Try to connect to each peer
 	for _, peerAddr := range peerList {
 		if strings.HasSuffix(peerAddr, s.opts.ListenAddr) {
+			log.Printf("Skipping own address: %s", peerAddr)
 			continue
 		}
 
@@ -167,30 +156,22 @@ func (s *FileServer) refreshPeers(fileID string) error {
 		go func(addr string) {
 			defer wg.Done()
 
+			log.Printf("Attempting to connect to peer: %s", addr)
+			if err := s.opts.Transport.Dial(addr); err != nil {
+				log.Printf("Failed to connect to peer %s: %v", addr, err)
+				return
+			}
+
+			// Wait briefly for the connection to be established
+			time.Sleep(time.Second)
+
+			// Verify connection was successful
 			s.mu.RLock()
-			_, exists := s.peers[addr]
+			_, connected := s.peers[p2p.NormalizeAddress(addr)]
 			s.mu.RUnlock()
 
-			if !exists {
-				log.Printf("Attempting to connect to peer: %s", addr)
-				if err := s.opts.Transport.Dial(addr); err != nil {
-					log.Printf("Failed to connect to peer %s: %v", addr, err)
-					return
-				}
-
-				// Wait briefly for the connection to be established
-				time.Sleep(time.Second)
-
-				// Verify connection was successful
-				s.mu.RLock()
-				_, connected := s.peers[addr]
-				s.mu.RUnlock()
-
-				if connected {
-					log.Printf("Successfully connected to peer: %s", addr)
-					successChan <- true
-				}
-			} else {
+			if connected {
+				log.Printf("Successfully connected to peer: %s", addr)
 				successChan <- true
 			}
 		}(peerAddr)
@@ -209,6 +190,13 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	select {
 	case _, ok := <-successChan:
 		if ok {
+			// Log current peers
+			s.mu.RLock()
+			log.Printf("Connected peers:")
+			for addr := range s.peers {
+				log.Printf("- %s", addr)
+			}
+			s.mu.RUnlock()
 			return nil
 		}
 	case <-timer.C:
@@ -245,6 +233,11 @@ func (s *FileServer) consumeRPCMessages() {
 func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, output *os.File) error {
 	log.Printf("Starting chunk download for file %s, chunk %d", fileID, chunkIndex)
 
+	meta, err := s.store.GetMetadata(fileID)
+	if err != nil {
+		return fmt.Errorf("failed to get metadata: %v", err)
+	}
+
 	s.mu.RLock()
 	peers := make([]p2p.Peer, 0, len(s.peers))
 	for addr, peer := range s.peers {
@@ -257,11 +250,9 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		return fmt.Errorf("no peers available")
 	}
 
-	// Create a channel to receive the response
 	responseChan := make(chan p2p.MessageChunkResponse, 1)
 	defer close(responseChan)
 
-	// Set up a response handler that will be called by the RPC system
 	responseHandler := func(msg p2p.Message) {
 		if msg.Type == "chunk_response" {
 			if resp, ok := msg.Payload.(p2p.MessageChunkResponse); ok {
@@ -270,13 +261,11 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		}
 	}
 
-	// Register our response handler
 	s.mu.Lock()
 	s.responseHandlers = append(s.responseHandlers, responseHandler)
 	handlerIndex := len(s.responseHandlers) - 1
 	s.mu.Unlock()
 
-	// Make sure we clean up our handler when we're done
 	defer func() {
 		s.mu.Lock()
 		s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
@@ -286,7 +275,6 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	for _, peer := range peers {
 		log.Printf("Attempting to download chunk %d from peer %s", chunkIndex, peer.RemoteAddr())
 
-		// Create and send the request
 		msg := p2p.Message{
 			Type: "chunk_request",
 			Payload: p2p.MessageChunkRequest{
@@ -306,20 +294,19 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			continue
 		}
 
-		log.Printf("Request sent, waiting for response...")
-
-		// Wait for response with timeout
 		select {
 		case resp := <-responseChan:
-			log.Printf("Received chunk response with %d bytes", len(resp.Data))
-
-			// Verify the response
 			if resp.FileID != fileID || resp.Chunk != chunkIndex {
 				log.Printf("Received mismatched chunk data")
 				continue
 			}
 
-			// Write the chunk data
+			// Verify chunk hash
+			if !verifyChunk(resp.Data, meta.ChunkHashes[chunkIndex]) {
+				log.Printf("Chunk verification failed for chunk %d", chunkIndex)
+				continue
+			}
+
 			offset := int64(chunkIndex * chunkSize)
 			bytesWritten, err := output.WriteAt(resp.Data, offset)
 			if err != nil {
@@ -327,7 +314,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 				continue
 			}
 
-			log.Printf("Successfully wrote %d bytes to file at offset %d", bytesWritten, offset)
+			log.Printf("Successfully wrote verified chunk %d (%d bytes)", chunkIndex, bytesWritten)
 			return nil
 
 		case <-time.After(5 * time.Second):
@@ -365,7 +352,7 @@ func (s *FileServer) handleRPCMessage(rpc p2p.RPC) error {
 	}
 
 	// Otherwise, handle as a request
-	normalizedAddr := normalizeAddress(rpc.From)
+	normalizedAddr := p2p.NormalizeAddress(rpc.From)
 	s.mu.RLock()
 	peer, exists := s.peers[normalizedAddr]
 	s.mu.RUnlock()
@@ -403,7 +390,7 @@ func (s *FileServer) onPeer(peer p2p.Peer) error {
 	log.Printf("New peer connection from: %s", origAddr)
 
 	// Use the same normalization function
-	addr := normalizeAddress(origAddr)
+	addr := p2p.NormalizeAddress(origAddr)
 
 	s.mu.Lock()
 	s.peers[addr] = peer
@@ -421,25 +408,21 @@ func (s *FileServer) ShareFile(filePath string) error {
 		return fmt.Errorf("failed to generate file ID: %v", err)
 	}
 
-	file, err := os.Open(filePath)
+	// Generate chunk hashes and total file hash
+	chunkHashes, totalHash, totalSize, err := generateFileHashes(filePath, ChunkSize)
 	if err != nil {
-		return fmt.Errorf("failed to open file: %v", err)
+		return fmt.Errorf("failed to generate hashes: %v", err)
 	}
-	defer file.Close()
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to get file info: %v", err)
-	}
-
-	numChunks := int((fileInfo.Size() + int64(ChunkSize) - 1) / int64(ChunkSize))
 
 	meta := &shared.Metadata{
 		FileID:        fileID,
-		NumChunks:     numChunks,
-		FileExtension: filepath.Ext(filePath),
+		NumChunks:     len(chunkHashes),
 		ChunkSize:     ChunkSize,
-		OriginalPath:  filePath, // Add this
+		FileExtension: filepath.Ext(filePath),
+		OriginalPath:  filePath,
+		ChunkHashes:   chunkHashes,
+		TotalHash:     totalHash,
+		TotalSize:     totalSize,
 	}
 
 	if err := s.store.saveMetadata(meta); err != nil {
@@ -452,7 +435,7 @@ func (s *FileServer) ShareFile(filePath string) error {
 		}
 	}
 
-	log.Printf("File %s shared with ID %s and %d chunks", filePath, fileID, numChunks)
+	log.Printf("File %s shared with ID %s and %d chunks", filePath, fileID, len(chunkHashes))
 	return nil
 }
 
@@ -484,38 +467,19 @@ func (s *FileServer) logPeerState() {
 func (s *FileServer) DownloadFile(fileID string) error {
 	log.Printf("Attempting to download file with ID: %s", fileID)
 
-	// Check if we have any connected peers
-	s.mu.RLock()
-	peerCount := len(s.peers)
-	s.mu.RUnlock()
-
-	if peerCount == 0 {
-		log.Printf("No peers available; attempting to refresh from tracker")
-		if err := s.refreshPeers(fileID); err != nil {
-			s.logPeerState()
-			return fmt.Errorf("failed to find peers: %v", err)
-		}
-
-		// Check again after refresh
-		s.mu.RLock()
-		peerCount = len(s.peers)
-		s.mu.RUnlock()
-
-		if peerCount == 0 {
-			return fmt.Errorf("no peers available after refresh")
-		}
+	// First refresh the peer list from tracker
+	if err := s.refreshPeers(fileID); err != nil {
+		return fmt.Errorf("failed to get peers from tracker: %v", err)
 	}
 
-	// Get metadata (either locally or from peers)
+	// Wait a bit for connections to establish
+	time.Sleep(2 * time.Second)
+
 	meta, err := s.store.GetMetadata(fileID)
 	if err != nil {
-		log.Printf("Local metadata not found, attempting to fetch from peers")
 		return fmt.Errorf("failed to get metadata: %v", err)
 	}
 
-	log.Printf("Found metadata, attempting to download %d chunks", meta.NumChunks)
-
-	// Create output file
 	outputFileName := fmt.Sprintf("downloaded_%s%s", fileID, meta.FileExtension)
 	outputFile, err := os.Create(outputFileName)
 	if err != nil {
@@ -523,14 +487,47 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	}
 	defer outputFile.Close()
 
-	// Download chunks
+	// Log current peers before download
+	s.mu.RLock()
+	log.Printf("Current peers before download: %d", len(s.peers))
+	for addr := range s.peers {
+		log.Printf("Connected to peer: %s", addr)
+	}
+	s.mu.RUnlock()
+
 	for chunk := 0; chunk < meta.NumChunks; chunk++ {
 		if err := s.downloadChunk(fileID, chunk, meta.ChunkSize, outputFile); err != nil {
 			return fmt.Errorf("failed to download chunk %d: %v", chunk, err)
 		}
 	}
 
-	log.Printf("Successfully downloaded file %s", outputFileName)
+	// Verify the complete file
+	if err := s.verifyDownloadedFile(outputFileName, meta.TotalHash); err != nil {
+		os.Remove(outputFileName) // Clean up the corrupted file
+		return fmt.Errorf("file verification failed: %v", err)
+	}
+
+	log.Printf("Successfully downloaded and verified file %s", outputFileName)
+	return nil
+}
+
+func (s *FileServer) verifyDownloadedFile(filePath string, expectedHash string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open downloaded file: %v", err)
+	}
+	defer file.Close()
+
+	hasher := sha1.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return fmt.Errorf("failed to calculate file hash: %v", err)
+	}
+
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if actualHash != expectedHash {
+		return fmt.Errorf("file verification failed: hash mismatch")
+	}
+
 	return nil
 }
 

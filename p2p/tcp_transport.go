@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -117,14 +118,24 @@ func (t *TCPTransport) startAcceptLoop() {
 	}
 }
 
-// In tcp_transport.go
+// Add this function to tcp_transport.go in the p2p package
+func NormalizeAddress(addr string) string {
+	// Handle IPv6 localhost address
+	if strings.HasPrefix(addr, "[::1]:") {
+		portIndex := strings.LastIndex(addr, ":")
+		if portIndex > 0 {
+			port := addr[portIndex+1:]
+			return fmt.Sprintf("localhost:%s", port)
+		}
+	}
+	return addr
+}
+
 // In tcp_transport.go
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	var err error
 
-	// Set up defer for connection cleanup
 	defer func() {
-		// Log connection closure with any associated error
 		if err != nil {
 			log.Printf("Closing connection to %s due to error: %v",
 				conn.RemoteAddr(), err)
@@ -135,7 +146,6 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 		conn.Close()
 	}()
 
-	// Create and initialize peer
 	peer := NewTCPPeer(conn, outbound)
 	log.Printf("New peer connection established: remote=%s outbound=%v",
 		conn.RemoteAddr(), outbound)
@@ -146,27 +156,22 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			conn.RemoteAddr(), err)
 		return
 	}
-	log.Printf("Handshake completed successfully with peer %s",
-		conn.RemoteAddr())
 
-	// Notify about new peer if callback is set
+	// Normalize the address before storing the peer
+	normalizedAddr := NormalizeAddress(conn.RemoteAddr().String())
+
+	// Add peer to active connections
 	if t.OnPeer != nil {
 		if err = t.OnPeer(peer); err != nil {
 			log.Printf("OnPeer callback failed for %s: %v",
 				conn.RemoteAddr(), err)
 			return
 		}
-		log.Printf("OnPeer callback completed successfully for %s",
-			conn.RemoteAddr())
 	}
 
-	// Start the main message reading loop
+	// Keep the connection alive and handle messages
 	for {
-		// Create a new RPC message container
 		rpc := RPC{}
-		log.Printf("Reading new message from peer %s", conn.RemoteAddr())
-
-		// Attempt to decode the incoming message
 		err = t.Decoder.Decode(conn, &rpc)
 		if err != nil {
 			if err == io.EOF {
@@ -178,12 +183,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			return
 		}
 
-		// Log successful message decode
-		log.Printf("Successfully decoded message from %s: StreamFlag=%v PayloadSize=%d",
-			conn.RemoteAddr(), rpc.Stream, len(rpc.Payload))
-
-		// Set message source
-		rpc.From = conn.RemoteAddr().String()
+		rpc.From = normalizedAddr
 
 		// Try to send the message through the RPC channel
 		select {
@@ -191,7 +191,6 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			log.Printf("Successfully forwarded message from %s to RPC channel",
 				conn.RemoteAddr())
 		default:
-			// Channel is full, log warning and drop message
 			log.Printf("Warning: RPC channel full, dropping message from %s",
 				conn.RemoteAddr())
 		}

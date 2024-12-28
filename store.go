@@ -78,8 +78,7 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 	}
 
 	// Read the chunk directly from the original file
-	// filePath := fmt.Sprintf("example.txt") // You'll need to store the original file path in metadata
-	filePath := meta.OriginalPath // You'll need to store the original file path in metadata
+	filePath := meta.OriginalPath // original file path in metadata struct in types.go
 
 	chunkData, err := s.store.ReadChunk(filePath, req.Chunk)
 	if err != nil {
