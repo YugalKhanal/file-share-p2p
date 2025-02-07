@@ -5,6 +5,9 @@ shared_files
 downloaded_*
 p2p-*
 largefile
+large-file
 *.sh
 *.pkg
 train-to-busan.mkv
+roadmap.txt
+.DS_Store
