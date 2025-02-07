@@ -506,7 +506,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 		return fmt.Errorf("failed to get peers from tracker: %v", err)
 	}
 
-	// Wait for connections to establish
+	// Wait a bit for connections to establish
 	time.Sleep(2 * time.Second)
 
 	meta, err := s.store.GetMetadata(fileID)
@@ -517,7 +517,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	// Initialize piece manager
 	pieceManager := NewPieceManager(meta.NumChunks, meta.ChunkHashes)
 
-	// Initialize piece availability
+	// Initialize piece availability for each peer
 	s.mu.RLock()
 	for addr := range s.peers {
 		pieces := make([]int, meta.NumChunks)
@@ -529,151 +529,129 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	s.mu.RUnlock()
 
 	outputFileName := fmt.Sprintf("downloaded_%s%s", fileID, meta.FileExtension)
-	outputFile, err := os.OpenFile(outputFileName, os.O_CREATE|os.O_RDWR, 0644)
+	outputFile, err := os.Create(outputFileName)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %v", err)
 	}
 	defer outputFile.Close()
 
-	// Pre-allocate file size
-	if err := outputFile.Truncate(meta.TotalSize); err != nil {
-		return fmt.Errorf("failed to allocate file size: %v", err)
-	}
-
-	// Use smaller window size for better control
-	maxConcurrent := 3
-	// If file is larger than 1 gigs
-	if meta.TotalSize > 1024*1024*1024 {
-		maxConcurrent = 5
-	}
-
-	// Creating channels, error and control channels
-	errorChan := make(chan error, maxConcurrent)
+	// Create semaphore to limit concurrent downloads
+	const maxConcurrent = 5
 	sem := make(chan struct{}, maxConcurrent)
-	downloadQueue := make(chan PieceInfo, meta.NumChunks)
+
+	// Create error channel with buffer for all pieces to prevent goroutine leaks
+	errorChan := make(chan error, meta.NumChunks)
 	var wg sync.WaitGroup
 
-	// Tracking failed pieces for retry
-	failedPieces := make(map[int]int) // piece index -> retry count
-	var failedMutex sync.Mutex
-
-	// Progress tracking
-	totalPieces := meta.NumChunks
+	// Track completed pieces for progress reporting
 	completedPieces := 0
+	startTime := time.Now()
+	lastProgressTime := startTime
 	var progressMutex sync.Mutex
 
-	// rate calc, start time
-	startTime := time.Now()
-
-	// progress bar
+	// Progress reporting goroutine
+	progressTicker := time.NewTicker(5 * time.Second)
+	defer progressTicker.Stop()
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
+		for range progressTicker.C {
 			progressMutex.Lock()
-			current := completedPieces
+			currentCompleted := completedPieces
+			currentTime := time.Now()
+			elapsed := currentTime.Sub(lastProgressTime).Seconds()
+			if elapsed > 0 {
+				piecesPerSecond := float64(currentCompleted-0) / elapsed
+				remainingPieces := meta.NumChunks - currentCompleted
+				eta := float64(remainingPieces) / piecesPerSecond
+				log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds",
+					currentCompleted, meta.NumChunks,
+					float64(currentCompleted)/float64(meta.NumChunks)*100,
+					piecesPerSecond, eta)
+			}
 			progressMutex.Unlock()
-
-			if current >= totalPieces {
-				return
-			}
-
-			elapsed := time.Since(startTime)
-			rate := float64(current) / elapsed.Seconds()
-			remaining := float64(totalPieces-current) / rate
-			log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds",
-				current, totalPieces, float64(current)/float64(totalPieces)*100,
-				rate, remaining)
 		}
 	}()
 
-	// Download worker
-	downloadWorker := func(piece PieceInfo) error {
-		defer wg.Done()
-		defer func() { <-sem }()
+	// Keep track of active download attempts
+	activeDownloads := make(map[int]bool)
+	var activeMutex sync.Mutex
 
-		failedMutex.Lock()
-		retryCount := failedPieces[piece.Index]
-		failedMutex.Unlock()
-
-		if retryCount >= 3 {
-			return fmt.Errorf("max retries exceeded for piece %d", piece.Index)
+	// Main download loop
+	for !pieceManager.IsComplete() {
+		pieces := pieceManager.GetNextPieces(maxConcurrent)
+		if len(pieces) == 0 {
+			// Check if we have any active downloads before breaking
+			activeMutex.Lock()
+			if len(activeDownloads) == 0 {
+				activeMutex.Unlock()
+				break
+			}
+			activeMutex.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
-		// Progressive backoff
-		if retryCount > 0 {
-			backoff := time.Duration(1<<uint(retryCount-1)) * 500 * time.Millisecond
-			time.Sleep(backoff)
-		}
-
-		if err := s.downloadChunk(fileID, piece.Index, meta.ChunkSize, outputFile); err != nil {
-			failedMutex.Lock()
-			failedPieces[piece.Index]++
-			failedMutex.Unlock()
-
-			pieceManager.MarkPieceStatus(piece.Index, PieceMissing)
-			return fmt.Errorf("failed to download piece %d: %v", piece.Index, err)
-		}
-
-		pieceManager.MarkPieceStatus(piece.Index, PieceVerified)
-
-		progressMutex.Lock()
-		completedPieces++
-		progressMutex.Unlock()
-
-		return nil
-	}
-
-	// Queue all pieces at the start
-	go func() {
-		pieces := pieceManager.GetNextPieces(meta.NumChunks)
 		for _, piece := range pieces {
-			downloadQueue <- piece
-		}
-		close(downloadQueue)
-	}()
+			wg.Add(1)
+			sem <- struct{}{} // Acquire semaphore
 
-	// Download loop
-	for piece := range downloadQueue {
-		wg.Add(1)
-		sem <- struct{}{} // Acquire semaphore
+			// Mark piece as being downloaded
+			activeMutex.Lock()
+			activeDownloads[piece.Index] = true
+			activeMutex.Unlock()
 
-		go func(p PieceInfo) {
-			if err := downloadWorker(p); err != nil {
-				select {
-				case errorChan <- err:
-					// Requeue if piece failed but hasn't exceeded retries.
-					failedMutex.Lock()
-					retryCount := failedPieces[p.Index]
-					failedMutex.Unlock()
+			go func(p PieceInfo) {
+				defer wg.Done()
+				defer func() { <-sem }() // Release semaphore
+				defer func() {
+					activeMutex.Lock()
+					delete(activeDownloads, p.Index)
+					activeMutex.Unlock()
+				}()
 
-					if retryCount < 3 {
-						downloadQueue <- p
+				// Try to download the piece with retries and backoff
+				var lastErr error
+				for retries := 0; retries < 3; retries++ {
+					// Exponential backoff between retries
+					if retries > 0 {
+						backoff := time.Duration(retries) * 500 * time.Millisecond
+						time.Sleep(backoff)
 					}
-				default:
-					log.Printf("Warning: error channel full: %v", err)
+
+					if err := s.downloadChunk(fileID, p.Index, meta.ChunkSize, outputFile); err != nil {
+						lastErr = err
+						pieceManager.MarkPieceStatus(p.Index, PieceMissing)
+						continue
+					}
+
+					pieceManager.MarkPieceStatus(p.Index, PieceVerified)
+					progressMutex.Lock()
+					completedPieces++
+					progressMutex.Unlock()
+					return
 				}
-			}
-		}(piece)
 
-		// Check for fatal errors
-		select {
-		case err := <-errorChan:
-			failedMutex.Lock()
-			retryCount := failedPieces[piece.Index]
-			failedMutex.Unlock()
-
-			if retryCount >= 3 {
-				return fmt.Errorf("download failed: %v", err)
-			}
-		default:
-			// Continue if no fatal errors
+				select {
+				case errorChan <- fmt.Errorf("failed to download piece %d after retries: %v", p.Index, lastErr):
+				default:
+					// Channel is full or closed, log the error
+					log.Printf("Error downloading piece %d: %v", p.Index, lastErr)
+				}
+			}(piece)
 		}
 	}
 
-	// Wait for completion
+	// Wait for all downloads to complete
 	wg.Wait()
+
+	// Check for any errors after all downloads are complete
+	select {
+	case err := <-errorChan:
+		if err != nil {
+			os.Remove(outputFileName)
+			return fmt.Errorf("download failed: %v", err)
+		}
+	default:
+	}
 
 	// Final verification
 	if err := s.verifyDownloadedFile(outputFileName, meta.TotalHash); err != nil {
@@ -684,145 +662,6 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	log.Printf("Successfully downloaded and verified file %s", outputFileName)
 	return nil
 }
-
-// func (s *FileServer) DownloadFile(fileID string) error {
-// 	log.Printf("Attempting to download file with ID: %s", fileID)
-//
-// 	if err := s.refreshPeers(fileID); err != nil {
-// 		return fmt.Errorf("failed to get peers from tracker: %v", err)
-// 	}
-//
-// 	// Wait for connections to establish
-// 	time.Sleep(2 * time.Second)
-//
-// 	meta, err := s.store.GetMetadata(fileID)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to get metadata: %v", err)
-// 	}
-//
-// 	// Initialize piece manager
-// 	pieceManager := NewPieceManager(meta.NumChunks, meta.ChunkHashes)
-//
-// 	// Initialize piece availability
-// 	s.mu.RLock()
-// 	for addr := range s.peers {
-// 		pieces := make([]int, meta.NumChunks)
-// 		for i := 0; i < meta.NumChunks; i++ {
-// 			pieces[i] = i
-// 		}
-// 		pieceManager.UpdatePeerPieces(addr, pieces)
-// 	}
-// 	s.mu.RUnlock()
-//
-// 	outputFileName := fmt.Sprintf("downloaded_%s%s", fileID, meta.FileExtension)
-// 	outputFile, err := os.Create(outputFileName)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to create output file: %v", err)
-// 	}
-// 	defer outputFile.Close()
-//
-// 	// Use smaller concurrency for better flow control
-// 	maxConcurrent := 5
-// 	if meta.TotalSize > 1024*1024*1024 { // If file is larger than 1GB
-// 		maxConcurrent = 10
-// 	}
-// 	sem := make(chan struct{}, maxConcurrent)
-//
-// 	// Create error channel
-// 	errorChan := make(chan error, maxConcurrent)
-// 	var wg sync.WaitGroup
-//
-// 	// Track failed pieces for retry
-// 	failedPieces := make(map[int]int) // piece index -> retry count
-// 	var failedMutex sync.Mutex
-//
-// 	// Download chunks in smaller batches
-// 	for !pieceManager.IsComplete() {
-// 		pieces := pieceManager.GetNextPieces(maxConcurrent)
-// 		if len(pieces) == 0 {
-// 			break
-// 		}
-//
-// 		downloadBatch := func(piece PieceInfo) error {
-// 			defer wg.Done()
-// 			defer func() { <-sem }()
-//
-// 			// Check retry count
-// 			failedMutex.Lock()
-// 			retryCount := failedPieces[piece.Index]
-// 			failedMutex.Unlock()
-//
-// 			if retryCount >= 3 {
-// 				return fmt.Errorf("max retries exceeded for piece %d", piece.Index)
-// 			}
-//
-// 			// Progressive backoff based on retry count
-// 			if retryCount > 0 {
-// 				backoff := time.Duration(retryCount) * 500 * time.Millisecond
-// 				time.Sleep(backoff)
-// 			}
-//
-// 			if err := s.downloadChunk(fileID, piece.Index, meta.ChunkSize, outputFile); err != nil {
-// 				failedMutex.Lock()
-// 				failedPieces[piece.Index]++
-// 				failedMutex.Unlock()
-//
-// 				pieceManager.MarkPieceStatus(piece.Index, PieceMissing)
-// 				return fmt.Errorf("failed to download piece %d: %v", piece.Index, err)
-// 			}
-//
-// 			pieceManager.MarkPieceStatus(piece.Index, PieceVerified)
-// 			return nil
-// 		}
-//
-// 		// Process batch
-// 		for _, piece := range pieces {
-// 			wg.Add(1)
-// 			sem <- struct{}{} // Acquire semaphore
-//
-// 			go func(p PieceInfo) {
-// 				if err := downloadBatch(p); err != nil {
-// 					select {
-// 					case errorChan <- err:
-// 					default:
-// 						log.Printf("Warning: error channel full: %v", err)
-// 					}
-// 				}
-// 			}(piece)
-// 		}
-//
-// 		// Wait for batch completion
-// 		wg.Wait()
-//
-// 		// Check for errors
-// 		select {
-// 		case err := <-errorChan:
-// 			// Only fail if piece has exceeded retry count
-// 			failedMutex.Lock()
-// 			retryCount := failedPieces[pieces[0].Index]
-// 			failedMutex.Unlock()
-//
-// 			if retryCount >= 3 {
-// 				os.Remove(outputFileName)
-// 				return fmt.Errorf("download failed: %v", err)
-// 			}
-// 		default:
-// 			// No errors, continue
-// 		}
-//
-// 		// Add small delay between batches
-// 		time.Sleep(100 * time.Millisecond)
-// 	}
-//
-// 	// Final verification
-// 	if err := s.verifyDownloadedFile(outputFileName, meta.TotalHash); err != nil {
-// 		os.Remove(outputFileName)
-// 		return fmt.Errorf("file verification failed: %v", err)
-// 	}
-//
-// 	log.Printf("Successfully downloaded and verified file %s", outputFileName)
-// 	return nil
-// }
 
 func (s *FileServer) verifyDownloadedFile(filePath string, expectedHash string) error {
 	file, err := os.Open(filePath)
