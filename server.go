@@ -71,8 +71,9 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 }
 
 // Fetches the public IP address of the server
+// Add this to the utility functions
 func getPublicIP() (string, error) {
-	resp, err := http.Get("http://checkip.amazonaws.com")
+	resp, err := http.Get("https://api.ipify.org?format=text")
 	if err != nil {
 		return "", err
 	}
@@ -83,7 +84,7 @@ func getPublicIP() (string, error) {
 		return "", err
 	}
 
-	return strings.TrimSpace(string(ip)), nil
+	return string(ip), nil
 }
 
 // Fetches the local IP address of the server
@@ -102,25 +103,28 @@ func getLocalIP() (string, error) {
 }
 
 // Determines the peer's full address, combining the detected IP with the listening port
-// func getPeerAddress(port string) (string, error) {
-// 	publicIP, err := getPublicIP()
-// 	if err != nil {
-// 		localIP, err := getLocalIP()
-// 		if err != nil {
-// 			return "", fmt.Errorf("failed to determine peer IP: %v", err)
-// 		}
-// 		return fmt.Sprintf("%s:%s", localIP, port), nil
-// 	}
-// 	return fmt.Sprintf("%s:%s", publicIP, port), nil
-// }
-
 func getPeerAddress(port string) (string, error) {
-	// For local development, always use localhost
+	ip, err := getPublicIP()
+	if err != nil {
+		// Fallback to local IP for development
+		return fmt.Sprintf("localhost%s", port), nil
+	}
+
+	// Extract port number
 	if strings.HasPrefix(port, ":") {
 		port = port[1:]
 	}
-	return fmt.Sprintf("localhost:%s", port), nil
+
+	return fmt.Sprintf("%s:%s", ip, port), nil
 }
+
+// func getPeerAddress(port string) (string, error) {
+// 	// For local development, always use localhost
+// 	if strings.HasPrefix(port, ":") {
+// 		port = port[1:]
+// 	}
+// 	return fmt.Sprintf("localhost:%s", port), nil
+// }
 
 // New function to refresh peer list from tracker
 func (s *FileServer) refreshPeers(fileID string) error {
@@ -750,22 +754,55 @@ func (s *FileServer) bootstrapNetwork() {
 
 // announceToTracker sends a request to the tracker to announce this peer's file availability.
 func announceToTracker(trackerAddr, fileID, listenAddr string) error {
-	peerAddr, err := getPeerAddress(listenAddr) // No need to strip ":" anymore
+	peerAddr, err := getPeerAddress(listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to determine peer address: %v", err)
 	}
 
-	url := fmt.Sprintf("%s/announce?file_id=%s&peer_addr=%s",
-		trackerAddr, fileID, peerAddr)
+	// Create announcement payload
+	announcement := struct {
+		FileID      string   `json:"file_id"`
+		PeerAddr    string   `json:"peer_addr"`
+		Name        string   `json:"name"`
+		Size        int64    `json:"size"`
+		Description string   `json:"description"`
+		Categories  []string `json:"categories"`
+		Extension   string   `json:"extension"`
+	}{
+		FileID:      fileID,
+		PeerAddr:    peerAddr,
+		Name:        "large-file", // You might want to get the actual filename
+		Size:        0,            // You should get the actual file size
+		Description: "File shared via ForeverStore",
+		Categories:  []string{"misc"},
+		Extension:   filepath.Ext("large-file"),
+	}
 
-	resp, err := http.Get(url)
+	// Convert to JSON
+	jsonData, err := json.Marshal(announcement)
+	if err != nil {
+		return fmt.Errorf("failed to marshal announcement: %v", err)
+	}
+
+	// Create POST request
+	url := fmt.Sprintf("%s/announce", trackerAddr)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send request
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to announce to tracker, status code: %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to announce to tracker, status code: %d, body: %s", resp.StatusCode, string(body))
 	}
 
 	log.Printf("Successfully announced to tracker at %s", trackerAddr)

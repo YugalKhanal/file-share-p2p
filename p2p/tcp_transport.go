@@ -108,6 +108,10 @@ func (t *TCPTransport) Close() error {
 	return t.listener.Close()
 }
 
+func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
+	t.OnPeer = handler
+}
+
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
 	conn, err := net.Dial("tcp", addr)
