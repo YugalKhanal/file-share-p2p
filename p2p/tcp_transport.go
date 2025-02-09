@@ -167,11 +167,6 @@ func NormalizeAddress(addr string) string {
 	return addr
 }
 
-// In tcp_transport.go
-// In tcp_transport.go
-
-// Add a new constant for heartbeat interval
-
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	var err error
 
@@ -187,6 +182,11 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(heartbeatInterval)
+		// Set TCP buffer sizes
+		tcpConn.SetReadBuffer(1024 * 1024)  // 1MB read buffer
+		tcpConn.SetWriteBuffer(1024 * 1024) // 1MB write buffer
+		// Enable TCP no delay
+		tcpConn.SetNoDelay(true)
 	}
 
 	peer := NewTCPPeer(conn, outbound)
@@ -209,29 +209,36 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 		}
 	}
 
-	// Start heartbeat goroutine
+	// Start heartbeat goroutine with backoff retry
 	heartbeatCh := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
+		failures := 0
 
 		for {
 			select {
 			case <-heartbeatCh:
 				return
 			case <-ticker.C:
-				// Send empty message as heartbeat
 				if err := peer.Send([]byte{}); err != nil {
-					log.Printf("Heartbeat failed for %s: %v", conn.RemoteAddr(), err)
-					return
+					failures++
+					if failures > 3 {
+						log.Printf("Too many heartbeat failures for %s, closing connection", conn.RemoteAddr())
+						conn.Close()
+						return
+					}
+					log.Printf("Heartbeat failed for %s (attempt %d/3): %v", conn.RemoteAddr(), failures, err)
+				} else {
+					failures = 0
 				}
 			}
 		}
 	}()
 
-	// Message handling loop with dynamic deadlines
+	// Message handling loop with error recovery
+	retries := 0
 	for {
-		// Reset read deadline before each message
 		conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 		rpc := RPC{}
@@ -239,30 +246,33 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 		if err != nil {
 			if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
 				log.Printf("Connection closed by peer %s", conn.RemoteAddr())
-			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				// Don't treat timeouts as fatal errors
-				continue
-			} else {
-				log.Printf("Error decoding message from %s: %v",
-					conn.RemoteAddr(), err)
+				break
 			}
-			close(heartbeatCh)
-			return
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				retries++
+				if retries > 3 {
+					log.Printf("Too many consecutive timeouts from %s", conn.RemoteAddr())
+					break
+				}
+				continue
+			}
+			log.Printf("Error decoding message from %s: %v", conn.RemoteAddr(), err)
+			break
 		}
+		retries = 0
 
-		// Reset write deadline after successful read
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 
 		rpc.From = normalizedAddr
 		select {
 		case t.rpcch <- rpc:
-			log.Printf("Successfully forwarded message from %s to RPC channel",
-				conn.RemoteAddr())
+			log.Printf("Successfully forwarded message from %s to RPC channel", conn.RemoteAddr())
 		case <-time.After(time.Second):
-			log.Printf("Warning: RPC channel full, dropping message from %s",
-				conn.RemoteAddr())
+			log.Printf("Warning: RPC channel full, dropping message from %s", conn.RemoteAddr())
 		}
 	}
+
+	close(heartbeatCh)
 }
 
 // Update the Send method in TCPPeer

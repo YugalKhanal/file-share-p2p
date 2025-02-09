@@ -27,28 +27,33 @@ func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
 		return fmt.Errorf("failed to read message length: %v", err)
 	}
 
-	// Sanity check for message length
-	if length == 0 || length > 1024*1024*64 { // 64MB max message size
-		return fmt.Errorf("invalid message length: %d", length)
+	// More strict message size validation
+	const maxMessageSize = 16 * 1024 * 1024 // 16MB max per message
+	if length == 0 || length > maxMessageSize {
+		return fmt.Errorf("invalid message length: %d (max allowed: %d)", length, maxMessageSize)
 	}
 
 	// Read the payload with a buffer
 	payload := make([]byte, 0, length)
-	// buffer := make([]byte, 32*1024) // 32KB chunks
-	buffer := make([]byte, 1024*1024) // 1MB chunks
+	buffer := make([]byte, 64*1024) // 64KB chunks for better network behavior
 
-	for uint32(len(payload)) < length {
-		remaining := length - uint32(len(payload))
+	bytesRead := uint32(0)
+	for bytesRead < length {
+		remaining := length - bytesRead
 		if remaining < uint32(len(buffer)) {
 			buffer = buffer[:remaining]
 		}
 
-		n, err := r.Read(buffer)
+		n, err := io.ReadFull(r, buffer)
 		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				return fmt.Errorf("connection closed while reading payload (got %d of %d bytes)", bytesRead+uint32(n), length)
+			}
 			return fmt.Errorf("failed to read payload: %v", err)
 		}
 
 		payload = append(payload, buffer[:n]...)
+		bytesRead += uint32(n)
 	}
 
 	msg.Payload = payload
