@@ -483,15 +483,48 @@ func (s *FileServer) ShareFile(filePath string) error {
 		return fmt.Errorf("failed to save metadata: %v", err)
 	}
 
-	if s.opts.TrackerAddr != "" {
-		if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr); err != nil {
-			log.Printf("Failed to announce to tracker: %v", err)
-		}
-	}
-
+	// Add file to active files
 	s.activeFilesMu.Lock()
 	s.activeFiles[fileID] = meta
 	s.activeFilesMu.Unlock()
+
+	// Try to announce to tracker if configured
+	if s.opts.TrackerAddr != "" {
+		// Initial announcement
+		if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr); err != nil {
+			log.Printf("Warning: Failed to announce to tracker: %v", err)
+			log.Printf("File will only be available for local sharing until tracker connection is restored")
+		}
+
+		// Start periodic announcements
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					s.activeFilesMu.RLock()
+					_, isActive := s.activeFiles[fileID]
+					s.activeFilesMu.RUnlock()
+
+					if !isActive {
+						log.Printf("File %s is no longer active, stopping announcements", fileID)
+						return
+					}
+
+					if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr); err != nil {
+						log.Printf("Failed to re-announce file %s: %v", fileID, err)
+					} else {
+						log.Printf("Successfully re-announced file %s to tracker", fileID)
+					}
+				case <-s.quitch:
+					log.Printf("Stopping announcements for file %s due to server shutdown", fileID)
+					return
+				}
+			}
+		}()
+	}
 
 	log.Printf("File %s shared with ID %s and %d chunks", filePath, fileID, len(chunkHashes))
 	return nil
@@ -752,6 +785,39 @@ func (s *FileServer) handleMetadataRequest(peer p2p.Peer, req p2p.MessageMetadat
 
 	log.Printf("Sent metadata for file ID %s to peer %s", req.FileID, peer.RemoteAddr())
 	return nil
+}
+
+func (s *FileServer) startTrackerAnnouncements() {
+	if s.opts.TrackerAddr == "" {
+		return
+	}
+
+	// Get list of active files
+	s.activeFilesMu.RLock()
+	activeFiles := make([]string, 0, len(s.activeFiles))
+	for fileID := range s.activeFiles {
+		activeFiles = append(activeFiles, fileID)
+	}
+	s.activeFilesMu.RUnlock()
+
+	// Start periodic announcements for each file
+	for _, fileID := range activeFiles {
+		go func(id string) {
+			ticker := time.NewTicker(30 * time.Second) // Re-announce every 30 seconds
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					if err := announceToTracker(s.opts.TrackerAddr, id, s.opts.ListenAddr); err != nil {
+						log.Printf("Failed to re-announce file %s: %v", id, err)
+					}
+				case <-s.quitch:
+					return
+				}
+			}
+		}(fileID)
+	}
 }
 
 func (s *FileServer) SetTrackerAddress(addr string) {

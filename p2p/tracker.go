@@ -305,7 +305,7 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *Tracker) cleanupStalePeers() {
-	threshold := time.Now().Add(-1 * time.Minute) // Consider peers stale after 1 minute
+	threshold := time.Now().Add(-2 * time.Minute) // Consider peers stale after 2 minute
 
 	for peerAddr, lastSeen := range t.peerLastSeen {
 		if lastSeen.Before(threshold) {
