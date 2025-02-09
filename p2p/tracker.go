@@ -78,6 +78,23 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// Clean up any stale peers first
+	t.cleanupStalePeers()
+
+	// Remove this peer from any other files it was previously announcing
+	for fileID, peers := range t.peerIndex {
+		if fileID != announce.FileID {
+			delete(peers, announce.PeerAddr)
+			if info, exists := t.fileIndex[fileID]; exists {
+				info.NumPeers = len(peers)
+				if info.NumPeers == 0 {
+					delete(t.fileIndex, fileID)
+					delete(t.peerIndex, fileID)
+				}
+			}
+		}
+	}
+
 	// Update file info
 	if _, exists := t.fileIndex[announce.FileID]; !exists {
 		t.fileIndex[announce.FileID] = &FileInfo{
@@ -98,8 +115,10 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	t.peerIndex[announce.FileID][announce.PeerAddr] = true
 	t.peerLastSeen[announce.PeerAddr] = time.Now()
 
-	// Update peer count
-	t.fileIndex[announce.FileID].NumPeers = len(t.peerIndex[announce.FileID])
+	// Update peer counts
+	if info, exists := t.fileIndex[announce.FileID]; exists {
+		info.NumPeers = len(t.peerIndex[announce.FileID])
+	}
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -256,13 +275,20 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	// Clean up stale peers before returning the list
+	t.cleanupStalePeers()
 
 	// Get the list of peers for this fileID
 	peers, exists := t.peerIndex[fileID]
-	if !exists {
+	t.mu.Unlock()
+
+	// Always return a JSON response, even when there are no peers
+	w.Header().Set("Content-Type", "application/json")
+
+	if !exists || len(peers) == 0 {
 		log.Printf("No peers found for file %s", fileID)
-		http.Error(w, "No peers found for this file", http.StatusNotFound)
+		// Return empty array instead of error
+		json.NewEncoder(w).Encode([]string{})
 		return
 	}
 
@@ -273,9 +299,33 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Peers for file %s: %v", fileID, peerList)
-	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(peerList); err != nil {
 		http.Error(w, "Failed to encode peer list", http.StatusInternalServerError)
+	}
+}
+
+func (t *Tracker) cleanupStalePeers() {
+	threshold := time.Now().Add(-1 * time.Minute) // Consider peers stale after 1 minute
+
+	for peerAddr, lastSeen := range t.peerLastSeen {
+		if lastSeen.Before(threshold) {
+			// Remove stale peer from all files
+			for fileID, peers := range t.peerIndex {
+				if peers[peerAddr] {
+					delete(peers, peerAddr)
+					// Update file info
+					if info, exists := t.fileIndex[fileID]; exists {
+						info.NumPeers = len(peers)
+						// Remove file if no peers are sharing it
+						if info.NumPeers == 0 {
+							delete(t.fileIndex, fileID)
+							delete(t.peerIndex, fileID)
+						}
+					}
+				}
+			}
+			delete(t.peerLastSeen, peerAddr)
+		}
 	}
 }
 

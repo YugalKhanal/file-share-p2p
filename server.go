@@ -40,6 +40,8 @@ type FileServer struct {
 	quitch           chan struct{}
 	mu               sync.RWMutex
 	responseHandlers []func(p2p.Message)
+	activeFiles      map[string]*shared.Metadata // fileID -> metadata of actively shared files
+	activeFilesMu    sync.RWMutex
 }
 
 func makeServer(listenAddr, bootstrapNode string) *FileServer {
@@ -61,10 +63,12 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	}
 
 	server := &FileServer{
-		opts:   opts,
-		store:  NewStore(StoreOpts{Root: opts.StorageRoot, PathTransformFunc: opts.PathTransformFunc}),
-		quitch: make(chan struct{}),
-		peers:  make(map[string]p2p.Peer),
+		opts:          opts,
+		store:         NewStore(StoreOpts{Root: opts.StorageRoot, PathTransformFunc: opts.PathTransformFunc}),
+		quitch:        make(chan struct{}),
+		peers:         make(map[string]p2p.Peer),
+		activeFiles:   make(map[string]*shared.Metadata),
+		activeFilesMu: sync.RWMutex{},
 	}
 	transport.SetOnPeer(server.onPeer)
 	return server
@@ -141,9 +145,18 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("tracker returned error: %s", string(body))
+	}
+
 	var peerList []string
 	if err := json.NewDecoder(resp.Body).Decode(&peerList); err != nil {
 		return fmt.Errorf("failed to decode peer list: %v", err)
+	}
+
+	if len(peerList) == 0 {
+		return fmt.Errorf("no peers are currently sharing file %s", fileID)
 	}
 
 	log.Printf("Received peer list from tracker: %v", peerList)
@@ -476,6 +489,10 @@ func (s *FileServer) ShareFile(filePath string) error {
 		}
 	}
 
+	s.activeFilesMu.Lock()
+	s.activeFiles[fileID] = meta
+	s.activeFilesMu.Unlock()
+
 	log.Printf("File %s shared with ID %s and %d chunks", filePath, fileID, len(chunkHashes))
 	return nil
 }
@@ -773,8 +790,8 @@ func announceToTracker(trackerAddr, fileID, listenAddr string) error {
 	}{
 		FileID:      fileID,
 		PeerAddr:    peerAddr,
-		Name:        "large-file", // You might want to get the actual filename
-		Size:        0,            // You should get the actual file size
+		Name:        "large-file",
+		Size:        0,
 		Description: "File shared via ForeverStore",
 		Categories:  []string{"misc"},
 		Extension:   filepath.Ext("large-file"),
@@ -786,27 +803,55 @@ func announceToTracker(trackerAddr, fileID, listenAddr string) error {
 		return fmt.Errorf("failed to marshal announcement: %v", err)
 	}
 
-	// Create POST request
-	url := fmt.Sprintf("%s/announce", trackerAddr)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
+	// Retry configuration
+	maxRetries := 3
+	backoff := time.Second
 
-	// Send request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("Retrying tracker announcement (attempt %d/%d) after %v",
+				attempt+1, maxRetries, backoff)
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to announce to tracker, status code: %d, body: %s", resp.StatusCode, string(body))
+		// Create POST request
+		url := fmt.Sprintf("%s/announce", trackerAddr)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			lastErr = fmt.Errorf("failed to create request: %v", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		// Create client with timeout
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+		}
+
+		// Send request
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("Announcement attempt failed: %v", err)
+			continue
+		}
+
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			lastErr = fmt.Errorf("tracker returned status %d: %s",
+				resp.StatusCode, string(body))
+			continue
+		}
+
+		// Success!
+		log.Printf("Successfully announced to tracker at %s", trackerAddr)
+		return nil
 	}
 
-	log.Printf("Successfully announced to tracker at %s", trackerAddr)
-	return nil
+	return fmt.Errorf("failed to announce to tracker after %d attempts: %v",
+		maxRetries, lastErr)
 }

@@ -72,30 +72,51 @@ func NewStore(opts StoreOpts) *Store {
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
 	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
 
-	meta, err := s.store.GetMetadata(req.FileID)
-	if err != nil {
-		log.Printf("Error getting metadata: %v", err)
-		return err
+	// First check if the file is actively being shared
+	s.activeFilesMu.RLock()
+	activeMeta, isActive := s.activeFiles[req.FileID]
+	s.activeFilesMu.RUnlock()
+
+	// If not actively shared, try to get metadata from storage
+	var meta *shared.Metadata
+	var err error
+	if isActive {
+		meta = activeMeta
+	} else {
+		meta, err = s.store.GetMetadata(req.FileID)
+		if err != nil {
+			log.Printf("Error getting metadata: %v", err)
+			return fmt.Errorf("file metadata not found: %v", err)
+		}
 	}
 
+	// Verify the chunk index is valid
+	if req.Chunk >= meta.NumChunks {
+		return fmt.Errorf("invalid chunk index %d, file only has %d chunks",
+			req.Chunk, meta.NumChunks)
+	}
+
+	// Read the chunk data
 	chunkData, err := s.store.ReadChunk(meta.OriginalPath, req.Chunk)
 	if err != nil {
 		log.Printf("Error reading chunk: %v", err)
-		return err
+		return fmt.Errorf("failed to read chunk: %v", err)
 	}
 
+	// Create and encode the response message
 	msg := p2p.NewChunkResponseMessage(req.FileID, req.Chunk, chunkData)
 
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(msg); err != nil {
 		log.Printf("Error encoding response: %v", err)
-		return err
+		return fmt.Errorf("failed to encode response: %v", err)
 	}
 
+	// Send the response
 	if err := peer.Send(buf.Bytes()); err != nil {
 		log.Printf("Error sending response: %v", err)
-		return err
+		return fmt.Errorf("failed to send response: %v", err)
 	}
 
 	log.Printf("Successfully sent chunk %d (%d bytes)", req.Chunk, len(chunkData))

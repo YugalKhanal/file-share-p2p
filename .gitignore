@@ -9,5 +9,4 @@ large-file
 *.sh
 *.pkg
 train-to-busan.mkv
-roadmap.txt
 .DS_Store
