@@ -44,25 +44,27 @@ func (p *TCPPeer) CloseStream() {
 
 func (p *TCPPeer) Send(b []byte) error {
 	if len(b) == 0 {
-		// Heartbeat message
-		return nil
+		return nil // Heartbeat message
 	}
 
 	p.SetWriteDeadline(time.Now().Add(writeTimeout))
 
-	// Write length prefix
-	length := uint32(len(b))
-	if err := binary.Write(p.Conn, binary.BigEndian, length); err != nil {
-		return fmt.Errorf("failed to write message length: %v", err)
+	// Ensure message size is within limits
+	if len(b) > 17*1024*1024 { // 17MB (16MB chunk + 1MB overhead)
+		return fmt.Errorf("message too large: %d bytes", len(b))
 	}
 
-	// Write payload
-	n, err := p.Conn.Write(b)
+	// Write in a single atomic operation to prevent partial writes
+	data := make([]byte, 4+len(b))
+	binary.BigEndian.PutUint32(data[:4], uint32(len(b)))
+	copy(data[4:], b)
+
+	n, err := p.Write(data)
 	if err != nil {
-		return fmt.Errorf("failed to write payload: %v", err)
+		return fmt.Errorf("failed to write: %v", err)
 	}
-	if n != len(b) {
-		return fmt.Errorf("incomplete write: wrote %d of %d bytes", n, len(b))
+	if n != len(data) {
+		return fmt.Errorf("incomplete write: wrote %d of %d bytes", n, len(data))
 	}
 
 	return nil

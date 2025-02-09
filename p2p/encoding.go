@@ -23,37 +23,30 @@ type DefaultDecoder struct{}
 
 // In encoding.go - Update the DefaultDecoder
 func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
-	// Read message length with timeout
-	var length uint32
-	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+	// Read message length
+	var lengthBuf [4]byte
+	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
 		return fmt.Errorf("failed to read message length: %v", err)
 	}
+	length := binary.BigEndian.Uint32(lengthBuf[:])
 
 	// Handle empty messages (heartbeats)
 	if length == 0 {
 		return nil
 	}
 
-	// Validate message size
-	const maxMessageSize = 32 * 1024 * 1024 // 32MB max message size
+	// Basic sanity check - max message size is 17MB (16MB chunk + 1MB overhead)
+	const maxMessageSize = 17 * 1024 * 1024
 	if length > maxMessageSize {
 		return fmt.Errorf("message too large: %d bytes (max: %d)", length, maxMessageSize)
 	}
 
-	// Read the complete message with retries
-	data := make([]byte, length)
-	totalRead := 0
-	for totalRead < int(length) {
-		n, err := r.Read(data[totalRead:])
-		if err != nil {
-			if err == io.EOF && totalRead > 0 {
-				return fmt.Errorf("incomplete message: got %d of %d bytes", totalRead, length)
-			}
-			return fmt.Errorf("failed to read message: %v", err)
-		}
-		totalRead += n
+	// Read the complete message
+	msg.Payload = make([]byte, length)
+	_, err := io.ReadFull(r, msg.Payload)
+	if err != nil {
+		return fmt.Errorf("failed to read message: %v", err)
 	}
 
-	msg.Payload = data
 	return nil
 }
