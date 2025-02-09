@@ -1,11 +1,14 @@
 package p2p
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
 	"io"
 )
+
+const ChunkSize = 16 * 1024 * 1024 //16MB chunks
 
 type Decoder interface {
 	Decode(io.Reader, *RPC) error
@@ -27,33 +30,49 @@ func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
 		return fmt.Errorf("failed to read message length: %v", err)
 	}
 
-	// More strict message size validation
-	const maxMessageSize = 16 * 1024 * 1024 // 16MB max per message
-	if length == 0 || length > maxMessageSize {
-		return fmt.Errorf("invalid message length: %d (max allowed: %d)", length, maxMessageSize)
+	// Handle empty messages (heartbeats)
+	if length == 0 {
+		return nil
 	}
 
-	// Read the payload with a buffer
-	payload := make([]byte, 0, length)
-	buffer := make([]byte, 64*1024) // 64KB chunks for better network behavior
+	// Read message type first (small fixed header)
+	headerBuf := make([]byte, 256) // Small buffer for message type/header
+	n, err := io.ReadFull(r, headerBuf[:min(256, length)])
+	if err != nil {
+		return fmt.Errorf("failed to read message header: %v", err)
+	}
 
-	bytesRead := uint32(0)
-	for bytesRead < length {
-		remaining := length - bytesRead
-		if remaining < uint32(len(buffer)) {
-			buffer = buffer[:remaining]
+	// Decode message type
+	var msgType struct {
+		Type string
+	}
+	if err := gob.NewDecoder(bytes.NewReader(headerBuf[:n])).Decode(&msgType); err != nil {
+		return fmt.Errorf("failed to decode message type: %v", err)
+	}
+
+	// Validate size based on message type
+	switch msgType.Type {
+	case MessageTypeChunkRequest:
+		if length > 1024 { // 1KB is more than enough for request
+			return fmt.Errorf("chunk request too large: %d bytes", length)
 		}
+	case MessageTypeChunkResponse:
+		expectedSize := ChunkSize + 1024 // 16MB chunk + 1KB overhead
+		if length > uint32(expectedSize) {
+			return fmt.Errorf("chunk response too large: %d bytes (max: %d)", length, expectedSize)
+		}
+	default:
+		return fmt.Errorf("unknown message type: %s", msgType.Type)
+	}
 
-		n, err := io.ReadFull(r, buffer)
+	// Read the rest of the message
+	payload := make([]byte, length)
+	copy(payload, headerBuf[:n])
+	if length > uint32(n) {
+		_, err = io.ReadFull(r, payload[n:])
 		if err != nil {
-			if err == io.ErrUnexpectedEOF {
-				return fmt.Errorf("connection closed while reading payload (got %d of %d bytes)", bytesRead+uint32(n), length)
-			}
-			return fmt.Errorf("failed to read payload: %v", err)
+			return fmt.Errorf("failed to read message body: %v", err)
 		}
-
-		payload = append(payload, buffer[:n]...)
-		bytesRead += uint32(n)
 	}
 
 	msg.Payload = payload
