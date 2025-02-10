@@ -251,137 +251,146 @@ func (s *FileServer) consumeRPCMessages() {
 }
 
 func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, outputFile *os.File) error {
-	// Get current list of peers
-	s.mu.RLock()
-	peers := make([]p2p.Peer, 0, len(s.peers))
-	for _, peer := range s.peers {
-		peers = append(peers, peer)
-	}
-	s.mu.RUnlock()
-
-	if len(peers) == 0 {
-		return fmt.Errorf("no peers available")
-	}
-
-	// Randomize peer order
-	rand.Shuffle(len(peers), func(i, j int) {
-		peers[i], peers[j] = peers[j], peers[i]
-	})
-
-	// Try each peer with individual timeouts
+	// Track retry attempts per piece
+	maxRetries := 3
 	var lastErr error
-	for _, peer := range peers {
-		// Create response channels with buffer
-		responseChan := make(chan p2p.MessageChunkResponse, 1)
-		errChan := make(chan error, 1)
-		done := make(chan struct{})
 
-		// Register response handler
-		s.mu.Lock()
-		handlerIndex := len(s.responseHandlers)
-		s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
-			// Check if done channel is closed
-			select {
-			case <-done:
-				return
-			default:
-			}
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Get current list of peers and shuffle them
+		s.mu.RLock()
+		peers := make([]p2p.Peer, 0, len(s.peers))
+		for _, peer := range s.peers {
+			peers = append(peers, peer)
+		}
+		s.mu.RUnlock()
 
-			if msg.Type != p2p.MessageTypeChunkResponse {
-				return
+		if len(peers) == 0 {
+			// Try to refresh peers if none available
+			if err := s.refreshPeers(fileID); err != nil {
+				time.Sleep(time.Second * time.Duration(attempt+1))
+				continue
 			}
-
-			var resp p2p.MessageChunkResponse
-			switch payload := msg.Payload.(type) {
-			case p2p.MessageChunkResponse:
-				resp = payload
-			case *p2p.MessageChunkResponse:
-				resp = *payload
-			default:
-				select {
-				case errChan <- fmt.Errorf("invalid payload type: %T", msg.Payload):
-				default:
-				}
-				return
+			s.mu.RLock()
+			for _, peer := range s.peers {
+				peers = append(peers, peer)
 			}
-
-			if resp.FileID != fileID || resp.Chunk != chunkIndex {
-				return
+			s.mu.RUnlock()
+			if len(peers) == 0 {
+				continue
 			}
-
-			select {
-			case responseChan <- resp:
-			default:
-			}
-		})
-		s.mu.Unlock()
-
-		// Cleanup function for this attempt
-		cleanup := func() {
-			close(done) // Signal handler to stop
-			s.mu.Lock()
-			if handlerIndex < len(s.responseHandlers) {
-				s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
-			}
-			s.mu.Unlock()
 		}
 
-		// Send request in goroutine
-		go func() {
+		// Randomize peer order for better load distribution
+		rand.Shuffle(len(peers), func(i, j int) {
+			peers[i], peers[j] = peers[j], peers[i]
+		})
+
+		// Try each peer for this attempt
+		for _, peer := range peers {
+			responseChan := make(chan p2p.MessageChunkResponse, 1)
+			errChan := make(chan error, 1)
+			done := make(chan struct{})
+
+			// Set up response handler
+			s.mu.Lock()
+			// handlerIndex := len(s.responseHandlers)
+			s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				if msg.Type != p2p.MessageTypeChunkResponse {
+					return
+				}
+
+				var resp p2p.MessageChunkResponse
+				switch payload := msg.Payload.(type) {
+				case p2p.MessageChunkResponse:
+					resp = payload
+				case *p2p.MessageChunkResponse:
+					resp = *payload
+				default:
+					select {
+					case errChan <- fmt.Errorf("invalid payload type: %T", msg.Payload):
+					default:
+					}
+					return
+				}
+
+				if resp.FileID != fileID || resp.Chunk != chunkIndex {
+					return
+				}
+
+				select {
+				case responseChan <- resp:
+				default:
+				}
+			})
+			s.mu.Unlock()
+
+			// Send request
 			msg := p2p.NewChunkRequestMessage(fileID, chunkIndex)
 			var buf bytes.Buffer
 			if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
+				close(done)
+				continue
 			}
 
 			if err := peer.Send(buf.Bytes()); err != nil {
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
-			}
-		}()
-
-		// Wait for response with timeout
-		timeout := 30 * time.Second
-		if chunkSize > 16*1024*1024 {
-			timeout = time.Duration(chunkSize/(2*1024*1024)) * time.Second
-		}
-
-		select {
-		case resp := <-responseChan:
-			if err := writeAndVerifyChunk(resp.Data, outputFile, chunkIndex, chunkSize); err != nil {
-				lastErr = fmt.Errorf("chunk write failed from peer %s: %v", peer.RemoteAddr(), err)
-				cleanup()
+				log.Printf("Failed to send request to peer %s: %v", peer.RemoteAddr(), err)
+				close(done)
 				continue
 			}
-			cleanup()
-			return nil
 
-		case err := <-errChan:
-			lastErr = fmt.Errorf("download failed from peer %s: %v", peer.RemoteAddr(), err)
-			cleanup()
+			// Wait for response with adaptive timeout
+			timeout := 30 * time.Second
+			if chunkSize > 16*1024*1024 {
+				timeout = time.Duration(chunkSize/(2*1024*1024)) * time.Second
+			}
 
-			// Remove failed peer
-			s.mu.Lock()
-			delete(s.peers, peer.RemoteAddr().String())
-			s.mu.Unlock()
+			// Add exponential backoff
+			timeout += time.Duration(attempt*5) * time.Second
 
-			continue
+			select {
+			case resp := <-responseChan:
+				if err := writeAndVerifyChunk(resp.Data, outputFile, chunkIndex, chunkSize); err != nil {
+					lastErr = fmt.Errorf("chunk write failed from peer %s: %v", peer.RemoteAddr(), err)
+					close(done)
+					continue
+				}
+				close(done)
+				return nil
 
-		case <-time.After(timeout):
-			lastErr = fmt.Errorf("timeout waiting for peer %s", peer.RemoteAddr())
-			cleanup()
+			case err := <-errChan:
+				lastErr = fmt.Errorf("download failed from peer %s: %v", peer.RemoteAddr(), err)
+				close(done)
+
+				// Remove failed peer
+				s.mu.Lock()
+				delete(s.peers, peer.RemoteAddr().String())
+				s.mu.Unlock()
+
+				continue
+
+			case <-time.After(timeout):
+				lastErr = fmt.Errorf("timeout waiting for peer %s", peer.RemoteAddr())
+				close(done)
+				continue
+			}
+		}
+
+		// If we got here, all peers failed for this attempt
+		if attempt < maxRetries-1 {
+			log.Printf("All peers failed for piece %d, attempt %d/%d. Last error: %v",
+				chunkIndex, attempt+1, maxRetries, lastErr)
+			time.Sleep(time.Second * time.Duration(attempt+1))
 			continue
 		}
 	}
 
-	return fmt.Errorf("all peers failed. last error: %v", lastErr)
+	return fmt.Errorf("all peers failed after %d attempts. last error: %v", maxRetries, lastErr)
 }
 
 func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int) error {
