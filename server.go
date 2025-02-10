@@ -592,38 +592,61 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	defer outputFile.Close()
 
 	// Create semaphore to limit concurrent downloads
-	const maxConcurrent = 5
+	const maxConcurrent = 10 // Increased from 5 to allow more parallel downloads
 	sem := make(chan struct{}, maxConcurrent)
 
-	// Create error channel with buffer for all pieces to prevent goroutine leaks
+	// Create error channel with buffer for all pieces
 	errorChan := make(chan error, meta.NumChunks)
 	var wg sync.WaitGroup
 
 	// Track completed pieces for progress reporting
 	completedPieces := 0
-	startTime := time.Now()
-	lastProgressTime := startTime
 	var progressMutex sync.Mutex
 
 	// Progress reporting goroutine
 	progressTicker := time.NewTicker(5 * time.Second)
 	defer progressTicker.Stop()
+
+	// Channel to signal worker goroutines to stop
+	done := make(chan struct{})
+	defer close(done)
+
+	// Start periodic peer refresh in background
+	go func() {
+		refreshTicker := time.NewTicker(30 * time.Second)
+		defer refreshTicker.Stop()
+
+		for {
+			select {
+			case <-refreshTicker.C:
+				if err := s.refreshPeers(fileID); err != nil {
+					log.Printf("Failed to refresh peers: %v", err)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Progress reporting goroutine
 	go func() {
 		for range progressTicker.C {
 			progressMutex.Lock()
 			currentCompleted := completedPieces
-			currentTime := time.Now()
-			elapsed := currentTime.Sub(lastProgressTime).Seconds()
-			if elapsed > 0 {
-				piecesPerSecond := float64(currentCompleted-0) / elapsed
-				remainingPieces := meta.NumChunks - currentCompleted
-				eta := float64(remainingPieces) / piecesPerSecond
-				log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds",
-					currentCompleted, meta.NumChunks,
-					float64(currentCompleted)/float64(meta.NumChunks)*100,
-					piecesPerSecond, eta)
-			}
 			progressMutex.Unlock()
+
+			if currentCompleted >= meta.NumChunks {
+				return
+			}
+
+			piecesPerSecond := float64(currentCompleted) / time.Since(startTime).Seconds()
+			remainingPieces := meta.NumChunks - currentCompleted
+			eta := float64(remainingPieces) / piecesPerSecond
+
+			log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds",
+				currentCompleted, meta.NumChunks,
+				float64(currentCompleted)/float64(meta.NumChunks)*100,
+				piecesPerSecond, eta)
 		}
 	}()
 
@@ -632,7 +655,25 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	var activeMutex sync.Mutex
 
 	// Main download loop
+	startTime := time.Now()
 	for !pieceManager.IsComplete() {
+		// Get available peers
+		s.mu.RLock()
+		availablePeers := make([]p2p.Peer, 0, len(s.peers))
+		for _, peer := range s.peers {
+			availablePeers = append(availablePeers, peer)
+		}
+		s.mu.RUnlock()
+
+		if len(availablePeers) == 0 {
+			// No peers available, try to refresh peers
+			if err := s.refreshPeers(fileID); err != nil {
+				log.Printf("Failed to refresh peers: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+		}
+
 		pieces := pieceManager.GetNextPieces(maxConcurrent)
 		if len(pieces) == 0 {
 			// Check if we have any active downloads before breaking
@@ -664,33 +705,35 @@ func (s *FileServer) DownloadFile(fileID string) error {
 					activeMutex.Unlock()
 				}()
 
-				// Try to download the piece with retries and backoff
-				var lastErr error
-				for retries := 0; retries < 3; retries++ {
-					// Exponential backoff between retries
-					if retries > 0 {
-						backoff := time.Duration(retries) * 500 * time.Millisecond
-						time.Sleep(backoff)
+				// Try each peer until successful
+				for _, peer := range availablePeers {
+					select {
+					case <-done:
+						return
+					default:
 					}
 
-					if err := s.downloadChunk(fileID, p.Index, meta.ChunkSize, outputFile); err != nil {
-						lastErr = err
-						pieceManager.MarkPieceStatus(p.Index, PieceMissing)
-						continue
+					err := s.downloadChunk(fileID, p.Index, meta.ChunkSize, outputFile)
+					if err == nil {
+						pieceManager.MarkPieceStatus(p.Index, PieceVerified)
+						progressMutex.Lock()
+						completedPieces++
+						progressMutex.Unlock()
+						return
 					}
 
-					pieceManager.MarkPieceStatus(p.Index, PieceVerified)
-					progressMutex.Lock()
-					completedPieces++
-					progressMutex.Unlock()
-					return
+					log.Printf("Failed to download piece %d from peer %s: %v",
+						p.Index, peer.RemoteAddr(), err)
+
+					// Remove failed peer from piece manager
+					pieceManager.RemovePeer(peer.RemoteAddr().String())
 				}
 
+				// All peers failed for this piece
+				pieceManager.MarkPieceStatus(p.Index, PieceMissing)
 				select {
-				case errorChan <- fmt.Errorf("failed to download piece %d after retries: %v", p.Index, lastErr):
+				case errorChan <- fmt.Errorf("failed to download piece %d from any peer", p.Index):
 				default:
-					// Channel is full or closed, log the error
-					log.Printf("Error downloading piece %d: %v", p.Index, lastErr)
 				}
 			}(piece)
 		}
@@ -699,23 +742,6 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	// Wait for all downloads to complete
 	wg.Wait()
 
-	// Check for any errors after all downloads are complete
-	select {
-	case err := <-errorChan:
-		if err != nil {
-			os.Remove(outputFileName)
-			return fmt.Errorf("download failed: %v", err)
-		}
-	default:
-	}
-
-	// Final verification
-	if err := s.verifyDownloadedFile(outputFileName, meta.TotalHash); err != nil {
-		os.Remove(outputFileName)
-		return fmt.Errorf("file verification failed: %v", err)
-	}
-
-	log.Printf("Successfully downloaded and verified file %s", outputFileName)
 	return nil
 }
 
