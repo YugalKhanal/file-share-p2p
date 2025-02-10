@@ -271,14 +271,22 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	// Try each peer with individual timeouts
 	var lastErr error
 	for _, peer := range peers {
-		// Create response channels
+		// Create response channels with buffer
 		responseChan := make(chan p2p.MessageChunkResponse, 1)
 		errChan := make(chan error, 1)
+		done := make(chan struct{})
 
 		// Register response handler
 		s.mu.Lock()
 		handlerIndex := len(s.responseHandlers)
 		s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
+			// Check if done channel is closed
+			select {
+			case <-done:
+				return
+			default:
+			}
+
 			if msg.Type != p2p.MessageTypeChunkResponse {
 				return
 			}
@@ -290,7 +298,10 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			case *p2p.MessageChunkResponse:
 				resp = *payload
 			default:
-				errChan <- fmt.Errorf("invalid payload type: %T", msg.Payload)
+				select {
+				case errChan <- fmt.Errorf("invalid payload type: %T", msg.Payload):
+				default:
+				}
 				return
 			}
 
@@ -307,13 +318,12 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 
 		// Cleanup function for this attempt
 		cleanup := func() {
+			close(done) // Signal handler to stop
 			s.mu.Lock()
 			if handlerIndex < len(s.responseHandlers) {
 				s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
 			}
 			s.mu.Unlock()
-			close(responseChan)
-			close(errChan)
 		}
 
 		// Send request in goroutine
@@ -321,12 +331,18 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			msg := p2p.NewChunkRequestMessage(fileID, chunkIndex)
 			var buf bytes.Buffer
 			if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 
 			if err := peer.Send(buf.Bytes()); err != nil {
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 		}()
