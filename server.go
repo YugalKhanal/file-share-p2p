@@ -603,6 +603,9 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	completedPieces := 0
 	var progressMutex sync.Mutex
 
+	// Record start time for progress calculations
+	startTime := time.Now()
+
 	// Progress reporting goroutine
 	progressTicker := time.NewTicker(5 * time.Second)
 	defer progressTicker.Stop()
@@ -655,7 +658,6 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	var activeMutex sync.Mutex
 
 	// Main download loop
-	startTime := time.Now()
 	for !pieceManager.IsComplete() {
 		// Get available peers
 		s.mu.RLock()
