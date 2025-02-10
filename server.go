@@ -250,13 +250,8 @@ func (s *FileServer) consumeRPCMessages() {
 	}
 }
 
-func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, output *os.File) error {
-	// Reduce initial timeout for faster failure detection
-	timeout := 30 * time.Second
-	if chunkSize > 16*1024*1024 { // For chunks larger than 16MB
-		timeout = time.Duration(chunkSize/(1024*1024)) * time.Second // Scale timeout with chunk size
-	}
-
+func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, outputFile *os.File) error {
+	// Get current list of peers
 	s.mu.RLock()
 	peers := make([]p2p.Peer, 0, len(s.peers))
 	for _, peer := range s.peers {
@@ -268,16 +263,19 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		return fmt.Errorf("no peers available")
 	}
 
-	// Randomize peer selection to distribute load
+	// Randomize peer order
 	rand.Shuffle(len(peers), func(i, j int) {
 		peers[i], peers[j] = peers[j], peers[i]
 	})
 
 	// Try each peer with individual timeouts
+	var lastErr error
 	for _, peer := range peers {
+		// Create response channels
 		responseChan := make(chan p2p.MessageChunkResponse, 1)
 		errChan := make(chan error, 1)
 
+		// Register response handler
 		s.mu.Lock()
 		handlerIndex := len(s.responseHandlers)
 		s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
@@ -307,6 +305,17 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		})
 		s.mu.Unlock()
 
+		// Cleanup function for this attempt
+		cleanup := func() {
+			s.mu.Lock()
+			if handlerIndex < len(s.responseHandlers) {
+				s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
+			}
+			s.mu.Unlock()
+			close(responseChan)
+			close(errChan)
+		}
+
 		// Send request in goroutine
 		go func() {
 			msg := p2p.NewChunkRequestMessage(fileID, chunkIndex)
@@ -323,32 +332,40 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		}()
 
 		// Wait for response with timeout
+		timeout := 30 * time.Second
+		if chunkSize > 16*1024*1024 {
+			timeout = time.Duration(chunkSize/(2*1024*1024)) * time.Second
+		}
+
 		select {
 		case resp := <-responseChan:
-			// Clean up handler
-			s.mu.Lock()
-			if handlerIndex < len(s.responseHandlers) {
-				s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
-			}
-			s.mu.Unlock()
-
-			// Verify and write chunk
-			if err := writeAndVerifyChunk(resp.Data, output, chunkIndex, chunkSize); err != nil {
+			if err := writeAndVerifyChunk(resp.Data, outputFile, chunkIndex, chunkSize); err != nil {
+				lastErr = fmt.Errorf("chunk write failed from peer %s: %v", peer.RemoteAddr(), err)
+				cleanup()
 				continue
 			}
+			cleanup()
 			return nil
 
 		case err := <-errChan:
-			log.Printf("Error downloading from peer %s: %v", peer.RemoteAddr(), err)
+			lastErr = fmt.Errorf("download failed from peer %s: %v", peer.RemoteAddr(), err)
+			cleanup()
+
+			// Remove failed peer
+			s.mu.Lock()
+			delete(s.peers, peer.RemoteAddr().String())
+			s.mu.Unlock()
+
 			continue
 
 		case <-time.After(timeout):
-			log.Printf("Timeout waiting for response from peer %s", peer.RemoteAddr())
+			lastErr = fmt.Errorf("timeout waiting for peer %s", peer.RemoteAddr())
+			cleanup()
 			continue
 		}
 	}
 
-	return fmt.Errorf("failed to download chunk %d from any peer", chunkIndex)
+	return fmt.Errorf("all peers failed. last error: %v", lastErr)
 }
 
 func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int) error {
