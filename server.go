@@ -498,6 +498,7 @@ func (s *FileServer) onPeer(peer p2p.Peer) error {
 	return nil
 }
 
+// In server.go
 func (s *FileServer) ShareFile(filePath string) error {
 	fileID, err := s.generateFileID(filePath)
 	if err != nil {
@@ -533,7 +534,7 @@ func (s *FileServer) ShareFile(filePath string) error {
 	// Try to announce to tracker if configured
 	if s.opts.TrackerAddr != "" {
 		// Initial announcement
-		if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr); err != nil {
+		if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr, meta); err != nil {
 			log.Printf("Warning: Failed to announce to tracker: %v", err)
 			log.Printf("File will only be available for local sharing until tracker connection is restored")
 		}
@@ -547,7 +548,7 @@ func (s *FileServer) ShareFile(filePath string) error {
 				select {
 				case <-ticker.C:
 					s.activeFilesMu.RLock()
-					_, isActive := s.activeFiles[fileID]
+					activeMeta, isActive := s.activeFiles[fileID]
 					s.activeFilesMu.RUnlock()
 
 					if !isActive {
@@ -555,7 +556,7 @@ func (s *FileServer) ShareFile(filePath string) error {
 						return
 					}
 
-					if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr); err != nil {
+					if err := announceToTracker(s.opts.TrackerAddr, fileID, s.opts.ListenAddr, activeMeta); err != nil {
 						log.Printf("Failed to re-announce file %s: %v", fileID, err)
 					} else {
 						log.Printf("Successfully re-announced file %s to tracker", fileID)
@@ -600,17 +601,27 @@ func (s *FileServer) logPeerState() {
 func (s *FileServer) DownloadFile(fileID string) error {
 	log.Printf("Attempting to download file with ID: %s", fileID)
 
+	// Get metadata from tracker
+	meta, err := s.getMetadataFromTracker(fileID)
+	if err != nil {
+		return fmt.Errorf("failed to get metadata from tracker: %v", err)
+	}
+
+	// Save metadata locally
+	if err := s.store.saveMetadata(meta); err != nil {
+		return fmt.Errorf("failed to save metadata locally: %v", err)
+	}
+
+	if err := s.refreshPeers(fileID); err != nil {
+		return fmt.Errorf("failed to get peers from tracker: %v", err)
+	}
+
 	if err := s.refreshPeers(fileID); err != nil {
 		return fmt.Errorf("failed to get peers from tracker: %v", err)
 	}
 
 	// Wait a bit for connections to establish
 	time.Sleep(2 * time.Second)
-
-	meta, err := s.store.GetMetadata(fileID)
-	if err != nil {
-		return fmt.Errorf("failed to get metadata: %v", err)
-	}
 
 	// Initialize piece manager
 	pieceManager := NewPieceManager(meta.NumChunks, meta.ChunkHashes)
@@ -857,6 +868,41 @@ func (s *FileServer) handleMetadataRequest(peer p2p.Peer, req p2p.MessageMetadat
 	return nil
 }
 
+// In server.go, add this new function
+// In server.go
+func (s *FileServer) getMetadataFromTracker(fileID string) (*shared.Metadata, error) {
+	url := fmt.Sprintf("%s/metadata?file_id=%s", s.opts.TrackerAddr, fileID)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get metadata from tracker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("tracker returned error: %s", string(body))
+	}
+
+	var fileInfo p2p.FileInfo // Updated to use p2p.FileInfo
+	if err := json.NewDecoder(resp.Body).Decode(&fileInfo); err != nil {
+		return nil, fmt.Errorf("failed to decode metadata: %v", err)
+	}
+
+	// Convert tracker's FileInfo to shared.Metadata
+	meta := &shared.Metadata{
+		FileID:        fileInfo.FileID,
+		NumChunks:     fileInfo.NumChunks,
+		ChunkSize:     fileInfo.ChunkSize,
+		FileExtension: fileInfo.Extension,
+		ChunkHashes:   fileInfo.ChunkHashes,
+		TotalHash:     fileInfo.TotalHash,
+		TotalSize:     fileInfo.TotalSize,
+	}
+
+	return meta, nil
+}
+
+// In server.go
 func (s *FileServer) startTrackerAnnouncements() {
 	if s.opts.TrackerAddr == "" {
 		return
@@ -879,7 +925,17 @@ func (s *FileServer) startTrackerAnnouncements() {
 			for {
 				select {
 				case <-ticker.C:
-					if err := announceToTracker(s.opts.TrackerAddr, id, s.opts.ListenAddr); err != nil {
+					// Get the current metadata for this file
+					s.activeFilesMu.RLock()
+					meta, exists := s.activeFiles[id]
+					s.activeFilesMu.RUnlock()
+
+					if !exists {
+						log.Printf("File %s is no longer active, stopping announcements", id)
+						return
+					}
+
+					if err := announceToTracker(s.opts.TrackerAddr, id, s.opts.ListenAddr, meta); err != nil {
 						log.Printf("Failed to re-announce file %s: %v", id, err)
 					}
 				case <-s.quitch:
@@ -908,7 +964,8 @@ func (s *FileServer) bootstrapNetwork() {
 }
 
 // announceToTracker sends a request to the tracker to announce this peer's file availability.
-func announceToTracker(trackerAddr, fileID, listenAddr string) error {
+// In server.go
+func announceToTracker(trackerAddr string, fileID string, listenAddr string, metadata *shared.Metadata) error {
 	peerAddr, err := getPeerAddress(listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to determine peer address: %v", err)
@@ -923,14 +980,24 @@ func announceToTracker(trackerAddr, fileID, listenAddr string) error {
 		Description string   `json:"description"`
 		Categories  []string `json:"categories"`
 		Extension   string   `json:"extension"`
+		NumChunks   int      `json:"num_chunks"`
+		ChunkSize   int      `json:"chunk_size"`
+		ChunkHashes []string `json:"chunk_hashes"`
+		TotalHash   string   `json:"total_hash"`
+		TotalSize   int64    `json:"total_size"`
 	}{
 		FileID:      fileID,
 		PeerAddr:    peerAddr,
-		Name:        "large-file",
-		Size:        0,
+		Name:        filepath.Base(metadata.OriginalPath),
+		Size:        metadata.TotalSize,
 		Description: "File shared via ForeverStore",
 		Categories:  []string{"misc"},
-		Extension:   filepath.Ext("large-file"),
+		Extension:   metadata.FileExtension,
+		NumChunks:   metadata.NumChunks,
+		ChunkSize:   metadata.ChunkSize,
+		ChunkHashes: metadata.ChunkHashes,
+		TotalHash:   metadata.TotalHash,
+		TotalSize:   metadata.TotalSize,
 	}
 
 	// Convert to JSON

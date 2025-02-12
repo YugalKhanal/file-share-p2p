@@ -20,11 +20,13 @@ func main() {
 	flag.Parse()
 
 	// Start the tracker if requested
+	// In main.go, update the startTracker block
 	if *startTracker {
 		tracker := p2p.NewTracker()
 		http.HandleFunc("/files", tracker.HandleListFiles)
 		http.HandleFunc("/announce", tracker.HandleAnnounce)
 		http.HandleFunc("/peers", tracker.HandleGetPeers)
+		http.HandleFunc("/metadata", tracker.HandleGetMetadata) // Add this line
 
 		tracker.StartCleanupLoop()
 		log.Printf("Starting tracker on %s", *listenAddr)

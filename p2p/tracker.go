@@ -15,15 +15,21 @@ import (
 )
 
 // Tracker stores metadata and peer information for each file
+// In tracker.go, update the FileInfo struct
 type FileInfo struct {
-	Name        string
-	Size        int64
-	UploadedAt  time.Time
-	Description string
-	Categories  []string
-	NumPeers    int
-	FileID      string
-	Extension   string
+	FileID      string    `json:"file_id"`
+	Name        string    `json:"name"`
+	Size        int64     `json:"size"`
+	UploadedAt  time.Time `json:"uploaded_at"`
+	Description string    `json:"description"`
+	Categories  []string  `json:"categories"`
+	NumPeers    int       `json:"num_peers"`
+	Extension   string    `json:"extension"`
+	NumChunks   int       `json:"num_chunks"`
+	ChunkSize   int       `json:"chunk_size"`
+	ChunkHashes []string  `json:"chunk_hashes"`
+	TotalHash   string    `json:"total_hash"`
+	TotalSize   int64     `json:"total_size"`
 }
 
 type Tracker struct {
@@ -54,6 +60,7 @@ func (t *Tracker) StartTracker(address string) {
 
 // handleAnnounce handles peers announcing the files they have
 // Endpoint: /announce?file_id=<fileID>&peer_addr=<peerAddr>
+// In tracker.go, update the announcement struct and HandleAnnounce
 func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -68,6 +75,11 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 		Description string   `json:"description"`
 		Categories  []string `json:"categories"`
 		Extension   string   `json:"extension"`
+		NumChunks   int      `json:"num_chunks"`
+		ChunkSize   int      `json:"chunk_size"`
+		ChunkHashes []string `json:"chunk_hashes"`
+		TotalHash   string   `json:"total_hash"`
+		TotalSize   int64    `json:"total_size"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&announce); err != nil {
@@ -78,33 +90,24 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Clean up any stale peers first
+	// Clean up stale peers
 	t.cleanupStalePeers()
-
-	// Remove this peer from any other files it was previously announcing
-	for fileID, peers := range t.peerIndex {
-		if fileID != announce.FileID {
-			delete(peers, announce.PeerAddr)
-			if info, exists := t.fileIndex[fileID]; exists {
-				info.NumPeers = len(peers)
-				if info.NumPeers == 0 {
-					delete(t.fileIndex, fileID)
-					delete(t.peerIndex, fileID)
-				}
-			}
-		}
-	}
 
 	// Update file info
 	if _, exists := t.fileIndex[announce.FileID]; !exists {
 		t.fileIndex[announce.FileID] = &FileInfo{
+			FileID:      announce.FileID,
 			Name:        announce.Name,
 			Size:        announce.Size,
 			UploadedAt:  time.Now(),
 			Description: announce.Description,
 			Categories:  announce.Categories,
-			FileID:      announce.FileID,
 			Extension:   announce.Extension,
+			NumChunks:   announce.NumChunks,
+			ChunkSize:   announce.ChunkSize,
+			ChunkHashes: announce.ChunkHashes,
+			TotalHash:   announce.TotalHash,
+			TotalSize:   announce.TotalSize,
 		}
 	}
 
@@ -115,10 +118,8 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	t.peerIndex[announce.FileID][announce.PeerAddr] = true
 	t.peerLastSeen[announce.PeerAddr] = time.Now()
 
-	// Update peer counts
-	if info, exists := t.fileIndex[announce.FileID]; exists {
-		info.NumPeers = len(t.peerIndex[announce.FileID])
-	}
+	// Update peer count
+	t.fileIndex[announce.FileID].NumPeers = len(t.peerIndex[announce.FileID])
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -131,6 +132,27 @@ func contains(slice []string, str string) bool {
 		}
 	}
 	return false
+}
+
+// In tracker.go, add this new handler
+func (t *Tracker) HandleGetMetadata(w http.ResponseWriter, r *http.Request) {
+	fileID := r.URL.Query().Get("file_id")
+	if fileID == "" {
+		http.Error(w, "file_id is required", http.StatusBadRequest)
+		return
+	}
+
+	t.mu.RLock()
+	fileInfo, exists := t.fileIndex[fileID]
+	t.mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(fileInfo)
 }
 
 func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
