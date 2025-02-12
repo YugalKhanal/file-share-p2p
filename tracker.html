@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ForeverStore Tracker</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.10/htmx.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/js/all.min.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+      <h1 class="text-3xl font-bold mb-8">ForeverStore Tracker</h1>
+
+      <!-- Search and Filter Form -->
+      <div class="mb-6 flex flex-wrap gap-4">
+        <div class="flex-1 min-w-[300px]">
+          <input
+            type="text"
+            name="search"
+            placeholder="Search files..."
+            class="w-full p-2 border rounded-lg"
+            hx-get="/files-partial"
+            hx-trigger="keyup changed delay:500ms"
+            hx-target="#files-grid"
+            hx-include="[name='category']"
+          />
+        </div>
+
+        <div class="flex items-center gap-2">
+          <select
+            name="category"
+            class="p-2 border rounded-lg"
+            hx-get="/files-partial"
+            hx-trigger="change"
+            hx-target="#files-grid"
+            hx-include="[name='search']"
+          >
+            <option value="all">All Categories</option>
+            {{range .Categories}}
+            <option value="{{.}}">{{.}}</option>
+            {{end}}
+          </select>
+        </div>
+      </div>
+
+      <!-- Files Grid -->
+      <div
+        id="files-grid"
+        hx-get="/files-partial"
+        hx-trigger="every 30s"
+        class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+      >
+        {{template "files-partial" .}}
+      </div>
+    </div>
+  </body>
+</html>

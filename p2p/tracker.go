@@ -4,7 +4,7 @@ import (
 	// "context"
 	"encoding/json"
 	"fmt"
-	"github.com/huin/goupnp/dcps/internetgateway2"
+	"html/template"
 	"log"
 	"net/http"
 	"sort"
@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/huin/goupnp/dcps/internetgateway2"
 )
 
 // Tracker stores metadata and peer information for each file
@@ -37,6 +39,31 @@ type Tracker struct {
 	peerIndex    map[string]map[string]bool // fileID -> peer addresses
 	peerLastSeen map[string]time.Time       // peer address -> last heartbeat
 	mu           sync.RWMutex
+}
+
+// In tracker.go
+type TemplateData struct {
+	Files      []*FileInfo
+	Categories []string
+}
+
+// Helper functions for the templates
+var templateFuncs = template.FuncMap{
+	"formatSize": func(bytes int64) string {
+		const unit = 1024
+		if bytes < unit {
+			return fmt.Sprintf("%d B", bytes)
+		}
+		div, exp := int64(unit), 0
+		for n := bytes / unit; n >= unit; n /= unit {
+			div *= unit
+			exp++
+		}
+		return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+	},
+	"formatDate": func(t time.Time) string {
+		return t.Format("Jan 02, 2006 15:04:05")
+	},
 }
 
 func NewTracker() *Tracker {
@@ -323,6 +350,124 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Peers for file %s: %v", fileID, peerList)
 	if err := json.NewEncoder(w).Encode(peerList); err != nil {
 		http.Error(w, "Failed to encode peer list", http.StatusInternalServerError)
+	}
+}
+
+// In tracker.go
+func (t *Tracker) HandleUI(w http.ResponseWriter, r *http.Request) {
+	t.mu.RLock()
+	categories := make(map[string]bool)
+	for _, info := range t.fileIndex {
+		for _, cat := range info.Categories {
+			categories[cat] = true
+		}
+	}
+	t.mu.RUnlock()
+
+	// Convert categories map to slice
+	categoryList := make([]string, 0, len(categories))
+	for cat := range categories {
+		categoryList = append(categoryList, cat)
+	}
+	sort.Strings(categoryList)
+
+	tmpl := template.Must(template.New("index").Funcs(templateFuncs).Parse(`
+        <!-- Insert the main template HTML here -->
+    `))
+
+	data := TemplateData{
+		Categories: categoryList,
+	}
+
+	if err := tmpl.Execute(w, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (t *Tracker) HandleFilesPartial(w http.ResponseWriter, r *http.Request) {
+	search := strings.ToLower(r.URL.Query().Get("search"))
+	category := r.URL.Query().Get("category")
+
+	t.mu.RLock()
+	files := make([]*FileInfo, 0, len(t.fileIndex))
+	for _, info := range t.fileIndex {
+		// Apply filters
+		if search != "" && !strings.Contains(strings.ToLower(info.Name), search) {
+			continue
+		}
+		if category != "" && category != "all" {
+			found := false
+			for _, cat := range info.Categories {
+				if cat == category {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		files = append(files, info)
+	}
+	t.mu.RUnlock()
+
+	// Sort files by upload date (newest first)
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].UploadedAt.After(files[j].UploadedAt)
+	})
+
+	tmpl := template.Must(template.New("files-partial").Funcs(templateFuncs).Parse(`
+        <!-- Insert the files-partial template HTML here -->
+    `))
+
+	data := TemplateData{
+		Files: files,
+	}
+
+	if err := tmpl.Execute(w, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (t *Tracker) HandleMetadataModal(w http.ResponseWriter, r *http.Request) {
+	fileID := r.URL.Query().Get("file_id")
+
+	t.mu.RLock()
+	info, exists := t.fileIndex[fileID]
+	t.mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	tmpl := template.Must(template.New("metadata-modal").Funcs(templateFuncs).Parse(`
+        <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+            <div class="bg-white p-6 rounded-lg max-w-2xl w-full mx-4">
+                <h2 class="text-2xl font-bold mb-4">File Details</h2>
+                <div class="space-y-2">
+                    <p><strong>File ID:</strong> {{.FileID}}</p>
+                    <p><strong>Name:</strong> {{.Name}}</p>
+                    <p><strong>Size:</strong> {{formatSize .Size}}</p>
+                    <p><strong>Total Hash:</strong> {{.TotalHash}}</p>
+                    <p><strong>Number of Chunks:</strong> {{.NumChunks}}</p>
+                    <p><strong>Chunk Size:</strong> {{formatSize (int64 .ChunkSize)}}</p>
+                    <p><strong>Active Peers:</strong> {{.NumPeers}}</p>
+                </div>
+                <div class="mt-6 flex justify-end">
+                    <button
+                        class="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300"
+                        onclick="this.closest('.fixed').remove()"
+                    >
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    `))
+
+	if err := tmpl.Execute(w, info); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
