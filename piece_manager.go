@@ -23,6 +23,7 @@ type PieceInfo struct {
 	Priority int             // higher number = higher priority
 }
 
+// PieceManager Keeps track of which peers are availalble for each piece
 type PieceManager struct {
 	pieces    map[int]*PieceInfo
 	numPieces int

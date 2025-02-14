@@ -21,7 +21,6 @@ func (dec GOBDecoder) Decode(r io.Reader, msg *RPC) error {
 
 type DefaultDecoder struct{}
 
-// In encoding.go - Update the DefaultDecoder
 func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
 	// Read message length
 	var lengthBuf [4]byte
@@ -35,7 +34,7 @@ func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
 		return nil
 	}
 
-	// Basic sanity check - max message size is 17MB (16MB chunk + 1MB overhead)
+	// Basic sanity check - max message size is 17MB (16MB chunk + 1MB overhead for potential metadata/headers)
 	const maxMessageSize = 17 * 1024 * 1024
 	if length > maxMessageSize {
 		return fmt.Errorf("message too large: %d bytes (max: %d)", length, maxMessageSize)

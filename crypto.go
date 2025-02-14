@@ -9,23 +9,27 @@ import (
 	"io"
 )
 
+// generateID generates a random 32 byte string.
 func generateID() string {
 	buf := make([]byte, 32)
 	io.ReadFull(rand.Reader, buf)
 	return hex.EncodeToString(buf)
 }
 
+// hashKey generates a hash of the key using MD5.
 func hashKey(key string) string {
 	hash := md5.Sum([]byte(key))
 	return hex.EncodeToString(hash[:])
 }
 
+// newEncryptionKey generates a new random 32 byte key.
 func newEncryptionKey() []byte {
 	keyBuf := make([]byte, 32)
 	io.ReadFull(rand.Reader, keyBuf)
 	return keyBuf
 }
 
+// copyStream copies the data from the src to the dst using the given cipher.Stream.
 func copyStream(stream cipher.Stream, blockSize int, src io.Reader, dst io.Writer) (int, error) {
 	var (
 		buf = make([]byte, 32*1024)
@@ -51,6 +55,7 @@ func copyStream(stream cipher.Stream, blockSize int, src io.Reader, dst io.Write
 	return nw, nil
 }
 
+// copyDecrypt decrypts the data from the src and writes it to the dst.
 func copyDecrypt(key []byte, src io.Reader, dst io.Writer) (int, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -68,6 +73,7 @@ func copyDecrypt(key []byte, src io.Reader, dst io.Writer) (int, error) {
 	return copyStream(stream, block.BlockSize(), src, dst)
 }
 
+// copyEncrypt encrypts the data from the src and writes it to the dst.
 func copyEncrypt(key []byte, src io.Reader, dst io.Writer) (int, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {

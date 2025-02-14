@@ -19,7 +19,6 @@ import (
 	"github.com/anthdm/foreverstore/shared"
 )
 
-// const ChunkSize = 1024 * 1024
 const ChunkSize = 1024 * 1024 * 16 // 16MB chunks instead of 1MB
 
 type Metadata struct {

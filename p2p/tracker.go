@@ -14,8 +14,7 @@ import (
 	"time"
 )
 
-// Tracker stores metadata and peer information for each file
-// In tracker.go, update the FileInfo struct
+// stores metadata and peer information for each file
 type FileInfo struct {
 	FileID      string    `json:"file_id"`
 	Name        string    `json:"name"`
@@ -32,6 +31,7 @@ type FileInfo struct {
 	TotalSize   int64     `json:"total_size"`
 }
 
+// Tracker stores metadata and peer information for each file
 type Tracker struct {
 	fileIndex    map[string]*FileInfo       // fileID -> file metadata
 	peerIndex    map[string]map[string]bool // fileID -> peer addresses
@@ -60,7 +60,6 @@ func (t *Tracker) StartTracker(address string) {
 
 // handleAnnounce handles peers announcing the files they have
 // Endpoint: /announce?file_id=<fileID>&peer_addr=<peerAddr>
-// In tracker.go, update the announcement struct and HandleAnnounce
 func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -115,6 +114,7 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	if _, exists := t.peerIndex[announce.FileID]; !exists {
 		t.peerIndex[announce.FileID] = make(map[string]bool)
 	}
+
 	t.peerIndex[announce.FileID][announce.PeerAddr] = true
 	t.peerLastSeen[announce.PeerAddr] = time.Now()
 
@@ -134,14 +134,16 @@ func contains(slice []string, str string) bool {
 	return false
 }
 
-// In tracker.go, add this new handler
+// HandleGetMetadata handles requests by peers for file metadata
 func (t *Tracker) HandleGetMetadata(w http.ResponseWriter, r *http.Request) {
 	fileID := r.URL.Query().Get("file_id")
+	//no fileID provided
 	if fileID == "" {
 		http.Error(w, "file_id is required", http.StatusBadRequest)
 		return
 	}
 
+	//lock the tracker
 	t.mu.RLock()
 	fileInfo, exists := t.fileIndex[fileID]
 	t.mu.RUnlock()
@@ -155,6 +157,7 @@ func (t *Tracker) HandleGetMetadata(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(fileInfo)
 }
 
+// HandleListFiles handles requests by peers to list all available files
 func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -204,6 +207,7 @@ func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// StartCleanupLoop starts a background goroutine to clean up inactive peers
 func (t *Tracker) StartCleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	go func() {
@@ -213,6 +217,7 @@ func (t *Tracker) StartCleanupLoop() {
 	}()
 }
 
+// cleanupInactivePeers removes peers that have not sent a heartbeat in the last 30 minutes
 func (t *Tracker) cleanupInactivePeers() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -241,6 +246,7 @@ func (t *Tracker) cleanupInactivePeers() {
 	}
 }
 
+// SetupUPnP sets up port forwarding using UPnP
 func setupUPnP(port int) error {
 	clients, errors, err := internetgateway2.NewWANIPConnection1Clients()
 	if err != nil {
@@ -288,6 +294,7 @@ func setupUPnP(port int) error {
 	return fmt.Errorf("failed to set up UPnP port mapping on port %d", port)
 }
 
+// HandleGetPeers handles requests by peers to get a list of peers for a file
 func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	fileID := r.URL.Query().Get("file_id")
 
@@ -326,6 +333,7 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// cleanupStalePeers removes peers that have not sent a heartbeat in the last 2 minutes
 func (t *Tracker) cleanupStalePeers() {
 	threshold := time.Now().Add(-2 * time.Minute) // Consider peers stale after 2 minute
 
