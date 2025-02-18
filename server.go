@@ -20,7 +20,6 @@ import (
 
 	"github.com/anthdm/foreverstore/p2p"
 	"github.com/anthdm/foreverstore/shared"
-	// "github.com/anthdm/foreverstore/shared"
 )
 
 type FileServerOpts struct {
@@ -44,11 +43,12 @@ type FileServer struct {
 	activeFilesMu    sync.RWMutex
 }
 
-func makeServer(listenAddr, bootstrapNode string) *FileServer {
+func makeServer(listenAddr, bootstrapNode, trackerAddr string) *FileServer {
 	tcpOpts := p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
 		HandshakeFunc: p2p.NOPHandshakeFunc,
 		Decoder:       p2p.DefaultDecoder{},
+		TrackerAddr:   trackerAddr,
 	}
 	transport := p2p.NewTCPTransport(tcpOpts)
 

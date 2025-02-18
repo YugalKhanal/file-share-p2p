@@ -75,6 +75,7 @@ type TCPTransportOpts struct {
 	HandshakeFunc HandshakeFunc
 	Decoder       Decoder
 	OnPeer        func(Peer) error
+	TrackerAddr   string
 }
 
 type TCPTransport struct {
@@ -82,15 +83,27 @@ type TCPTransport struct {
 	listener   net.Listener
 	rpcch      chan RPC
 	bufferSize int //adding buffer size for large downloads
+	NATService *NATService
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
-	return &TCPTransport{
+	t := &TCPTransport{
 		TCPTransportOpts: opts,
-		// 1024 -> 4096, increased channel buffer to handle more concurrent messages for larger file transfers
-		rpcch:      make(chan RPC, 16384),
-		bufferSize: 128 * 1024 * 1024, //n-MB buffersize
+		rpcch:            make(chan RPC, 16384),
+		bufferSize:       128 * 1024 * 1024,
 	}
+
+	// Initialize NAT service if tracker address is provided
+	if opts.TrackerAddr != "" {
+		natService, err := NewNATService(t, opts.TrackerAddr)
+		if err != nil {
+			log.Printf("Warning: Failed to initialize NAT service: %v", err)
+		} else {
+			t.NATService = natService
+		}
+	}
+
+	return t
 }
 
 // Addr implements the Transport interface return the address
@@ -107,7 +120,13 @@ func (t *TCPTransport) Consume() <-chan RPC {
 
 // Close implements the Transport interface.
 func (t *TCPTransport) Close() error {
-	return t.listener.Close()
+	if t.NATService != nil {
+		t.NATService.Close()
+	}
+	if t.listener != nil {
+		return t.listener.Close()
+	}
+	return nil
 }
 
 func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
@@ -116,13 +135,30 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
-	conn, err := net.Dial("tcp", addr)
+	if t.NATService != nil {
+		// Attempt NAT traversal
+		if err := t.NATService.InitiateConnection(addr); err != nil {
+			log.Printf("NAT traversal failed for %s: %v", addr, err)
+		}
+	}
+
+	// Try connecting with multiple attempts
+	var conn net.Conn
+	var err error
+
+	for attempts := 0; attempts < 3; attempts++ {
+		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Second * time.Duration(attempts+1))
+	}
+
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to establish connection after retries: %v", err)
 	}
 
 	go t.handleConn(conn, true)
-
 	return nil
 }
 
