@@ -39,7 +39,7 @@ func main() {
 	}
 
 	// Initialize and start the file server
-	server := makeServer(*listenAddr, *bootstrapNode)
+	server := makeServer(*listenAddr, *bootstrapNode, *trackerAddr)
 	server.SetTrackerAddress(*trackerAddr)
 
 	go func() {

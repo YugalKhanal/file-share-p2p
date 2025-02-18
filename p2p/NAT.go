@@ -60,13 +60,18 @@ func NewNATService(tcpTransport *TCPTransport, trackerAddr string) (*NATService,
 		closeChan:    make(chan struct{}),
 	}
 
-	// Initialize STUN client
-	client := stun.NewClient()
+	// Create STUN client with our UDP connection
+	client, err := stun.NewClient(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create STUN client: %v", err)
+	}
 	service.stunClient = client
 
 	// Start NAT detection
 	if err := service.detectNAT(); err != nil {
 		conn.Close()
+		client.Close()
 		return nil, fmt.Errorf("NAT detection failed: %v", err)
 	}
 
@@ -85,59 +90,53 @@ func (n *NATService) detectNAT() error {
 	// Create a channel for the result
 	resultChan := make(chan error, 1)
 
+	n.mu.Lock()
+	localAddr := n.udpConn.LocalAddr().(*net.UDPAddr)
+	n.privateAddr = localAddr
+	n.mu.Unlock()
+
 	go func() {
 		// Create STUN message
 		message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
-		// Send request to STUN server
-		conn, err := net.Dial("udp4", publicSTUNServer)
+		// Connect to STUN server
+		c, err := stun.Dial("udp4", publicSTUNServer)
 		if err != nil {
 			resultChan <- fmt.Errorf("failed to connect to STUN server: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer c.Close()
 
-		udpConn := conn.(*net.UDPConn)
+		// Send binding request and wait for response
+		if err := c.Do(message, func(res stun.Event) {
+			if res.Error != nil {
+				resultChan <- res.Error
+				return
+			}
 
-		// Send the message
-		_, err = udpConn.Write(message.Raw)
-		if err != nil {
-			resultChan <- fmt.Errorf("failed to send STUN request: %v", err)
+			// Get XOR-MAPPED-ADDRESS from STUN response
+			var xorAddr stun.XORMappedAddress
+			if err := xorAddr.GetFrom(res.Message); err != nil {
+				resultChan <- err
+				return
+			}
+
+			// Store the public address
+			n.mu.Lock()
+			n.publicAddr = &net.UDPAddr{
+				IP:   xorAddr.IP,
+				Port: xorAddr.Port,
+			}
+			n.mu.Unlock()
+
+			log.Printf("NAT Detection - Public: %s, Private: %s",
+				n.publicAddr.String(), n.privateAddr.String())
+
+			resultChan <- nil
+		}); err != nil {
+			resultChan <- err
 			return
 		}
-
-		// Read response
-		buffer := make([]byte, 1024)
-		n, err := udpConn.Read(buffer)
-		if err != nil {
-			resultChan <- fmt.Errorf("failed to read STUN response: %v", err)
-			return
-		}
-
-		// Decode response
-		response := &stun.Message{Raw: buffer[:n]}
-		if err := response.Decode(); err != nil {
-			resultChan <- fmt.Errorf("failed to decode STUN response: %v", err)
-			return
-		}
-
-		var xorAddr stun.XORMappedAddress
-		if err := xorAddr.GetFrom(response); err != nil {
-			resultChan <- fmt.Errorf("failed to get address from STUN response: %v", err)
-			return
-		}
-
-		// Store the addresses
-		n.publicAddr = &net.UDPAddr{
-			IP:   xorAddr.IP,
-			Port: xorAddr.Port,
-		}
-		n.privateAddr = n.udpConn.LocalAddr().(*net.UDPAddr)
-
-		log.Printf("NAT Detection - Public: %s, Private: %s",
-			n.publicAddr.String(), n.privateAddr.String())
-
-		resultChan <- nil
 	}()
 
 	// Wait for result or timeout
@@ -176,8 +175,6 @@ func (n *NATService) handleUDP() {
 		}
 	}
 }
-
-// NewNATService creates a new NAT traversal service
 
 func (n *NATService) handleSTUNMessage(e stun.Event) {
 	if e.Error != nil {
