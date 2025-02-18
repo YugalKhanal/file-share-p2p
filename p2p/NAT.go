@@ -276,6 +276,7 @@ func (n *NATService) sendHolePunch(addr *net.UDPAddr) {
 	}
 }
 
+// NAT.go
 func (n *NATService) InitiateConnection(peerAddr string) error {
 	addrs := strings.Split(peerAddr, "|")
 	if len(addrs) == 0 {
@@ -307,29 +308,25 @@ func (n *NATService) InitiateConnection(peerAddr string) error {
 				return
 			}
 
-			// Send bursts with increasing sequence numbers
-			for j := 0; j < 3; j++ {
-				msg := holePunchMessage{
-					Type:        "punch",
-					PeerID:      n.tcpTransport.ListenAddr,
-					PublicAddr:  n.publicAddr.String(),
-					PrivateAddr: n.privateAddr.String(),
-					Timestamp:   time.Now(),
-					Sequence:    sequence,
-				}
-				sequence++
+			msg := holePunchMessage{
+				Type:        "punch",
+				PeerID:      n.tcpTransport.ListenAddr,
+				PublicAddr:  n.publicAddr.String(),
+				PrivateAddr: n.privateAddr.String(),
+				Timestamp:   time.Now(),
+				Sequence:    sequence,
+			}
+			sequence++
 
-				data, err := json.Marshal(msg)
-				if err != nil {
-					log.Printf("Failed to marshal hole punch message: %v", err)
-					continue
-				}
+			data, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("Failed to marshal hole punch message: %v", err)
+				return
+			}
 
-				if _, err := n.udpConn.WriteToUDP(data, udpAddr); err != nil {
-					log.Printf("Failed to send hole punch to %s: %v", udpAddr.String(), err)
-				}
-
-				time.Sleep(50 * time.Millisecond)
+			_, err = n.udpConn.WriteToUDP(data, udpAddr)
+			if err != nil {
+				log.Printf("Failed to send hole punch to %s: %v", udpAddr.String(), err)
 			}
 
 			time.Sleep(interval)
@@ -345,7 +342,7 @@ func (n *NATService) InitiateConnection(peerAddr string) error {
 			return nil
 		}
 	case <-time.After(5 * time.Second):
-		// Fall through to TCP
+		log.Printf("NAT traversal timed out to %s", publicAddr)
 	}
 
 	return fmt.Errorf("NAT traversal failed, falling back to TCP")

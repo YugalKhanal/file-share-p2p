@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -73,6 +74,24 @@ func makeServer(listenAddr, bootstrapNode, trackerAddr string) *FileServer {
 	return server
 }
 
+func isPrivateIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate()
+}
+
+func filterPeerList(peerList []string) []string {
+	var filtered []string
+	for _, peer := range peerList {
+		host, _, err := net.SplitHostPort(peer)
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip != nil && !isPrivateIP(ip) {
+			filtered = append(filtered, peer)
+		}
+	}
+	return filtered
+}
 
 // Determines the peer's full address, combining the detected IP with the listening port
 func getPeerAddress(listenAddr string) (string, error) {
@@ -120,6 +139,7 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	}
 
 	var peerList []string
+	peerList = filterPeerList(peerList)
 	if err := json.NewDecoder(resp.Body).Decode(&peerList); err != nil {
 		return fmt.Errorf("failed to decode peer list: %v", err)
 	}
