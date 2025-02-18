@@ -80,22 +80,30 @@ type TCPTransportOpts struct {
 
 type TCPTransport struct {
 	TCPTransportOpts
-	listener    net.Listener
-	udpConn     *net.UDPConn
-	rpcch       chan RPC
-	bufferSize  int
-	natService  *NATService
-	punchingMap sync.Map // tracks ongoing hole punching attempts
+	listener     net.Listener
+	udpConn      *net.UDPConn
+	rpcch        chan RPC
+	bufferSize   int
+	natService   *NATService
+	punchingMap  sync.Map
+	punchingChan chan string // Channel to coordinate hole punching
+	udpPort      int         // UDP port for hole punching
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
-	natService := NewNATService(nil) // Use default STUN servers
+	// Parse the port from ListenAddr
+	_, portStr, _ := net.SplitHostPort(opts.ListenAddr)
+	port, _ := strconv.Atoi(portStr)
+
+	natService := NewNATService(nil)
 
 	return &TCPTransport{
 		TCPTransportOpts: opts,
 		rpcch:            make(chan RPC, 16384),
 		bufferSize:       128 * 1024 * 1024,
 		natService:       natService,
+		punchingChan:     make(chan string, 10),
+		udpPort:          port, // Use same port as TCP
 	}
 }
 
@@ -125,41 +133,42 @@ func (t *TCPTransport) Dial(addr string) error {
 	// Initialize NAT service
 	if err := t.natService.Initialize(t.getPort()); err != nil {
 		log.Printf("NAT service initialization failed: %v", err)
-		// Continue anyway, as we'll try direct connection
 	}
 
-	// Split the address if it contains multiple options (public|private)
 	addrs := strings.Split(addr, "|")
 	var lastErr error
+	successChan := make(chan struct{})
 
-	// Try each address
 	for _, address := range addrs {
-		// Start hole punching first
-		if err := t.punchHole(address); err != nil {
-			log.Printf("Hole punching setup failed for %s: %v", address, err)
-		}
-
-		// Give hole punching some time to work
-		time.Sleep(2 * time.Second)
-
-		// Try multiple connection attempts
-		for attempts := 0; attempts < 3; attempts++ {
-			log.Printf("Attempting TCP connection to %s (attempt %d/3)", address, attempts+1)
-
-			conn, err := net.DialTimeout("tcp", address, 5*time.Second)
-			if err == nil {
-				go t.handleConn(conn, true)
-				return nil
+		go func(addr string) {
+			// Start hole punching
+			if err := t.punchHole(addr); err != nil {
+				log.Printf("Hole punching setup failed for %s: %v", addr, err)
+				return
 			}
-			lastErr = err
 
-			if attempts < 2 {
-				time.Sleep(time.Second * time.Duration(attempts+1))
+			// Wait for punch response or timeout
+			select {
+			case <-t.punchingChan:
+				// Hole punching succeeded, connection will be handled by handleUDPMessages
+				successChan <- struct{}{}
+			case <-time.After(5 * time.Second):
+				// Try direct TCP connection as fallback
+				if conn, err := net.DialTimeout("tcp", addr, 5*time.Second); err == nil {
+					go t.handleConn(conn, true)
+					successChan <- struct{}{}
+				}
 			}
-		}
+		}(address)
 	}
 
-	return fmt.Errorf("failed to connect to any address: %v", lastErr)
+	// Wait for any successful connection
+	select {
+	case <-successChan:
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("failed to connect to any address: %v", lastErr)
+	}
 }
 
 func (t *TCPTransport) getPort() int {

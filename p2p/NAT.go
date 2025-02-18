@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -314,91 +316,96 @@ func (n *NATService) sendSTUNBindingRequest(conn *net.UDPConn, serverAddr *net.U
 	return err
 }
 
-func isPortAvailable(port int) bool {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return false
+func (t *TCPTransport) handleUDPMessages() {
+	buf := make([]byte, 1024)
+	for {
+		n, remoteAddr, err := t.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("UDP read error: %v", err)
+			continue
+		}
+
+		msg := string(buf[:n])
+		if strings.HasPrefix(msg, "PUNCH:") {
+			// Extract the TCP address from the punch message
+			tcpAddr := strings.TrimPrefix(msg, "PUNCH:")
+
+			// Send acknowledgment
+			t.udpConn.WriteToUDP([]byte("PUNCH-ACK:"+t.ListenAddr), remoteAddr)
+
+			// Try TCP connection
+			go func() {
+				// Small delay to allow both sides to set up
+				time.Sleep(100 * time.Millisecond)
+				conn, err := net.DialTimeout("tcp", tcpAddr, 5*time.Second)
+				if err == nil {
+					t.punchingChan <- tcpAddr
+					go t.handleConn(conn, true)
+				}
+			}()
+		} else if strings.HasPrefix(msg, "PUNCH-ACK:") {
+			tcpAddr := strings.TrimPrefix(msg, "PUNCH-ACK:")
+			t.punchingChan <- tcpAddr
+		}
 	}
-	ln.Close()
-	return true
 }
 
 func (t *TCPTransport) punchHole(remoteAddr string) error {
 	// Parse the remote address
-	tcpAddr, err := net.ResolveTCPAddr("tcp", remoteAddr)
+	host, portStr, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		return fmt.Errorf("invalid remote address: %v", err)
 	}
 
-	// Create UDP address for hole punching
-	udpAddr := &net.UDPAddr{
-		IP:   tcpAddr.IP,
-		Port: tcpAddr.Port,
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid port number: %v", err)
 	}
 
-	// Create local UDP socket if it doesn't exist
+	// Initialize UDP connection if not already done
 	if t.udpConn == nil {
-		// Get our public endpoint from NAT service
-		publicIP, publicPort := t.natService.GetPublicAddress()
+		// Use the same port as TCP for UDP
 		localAddr := &net.UDPAddr{
-			IP:   net.ParseIP(publicIP),
-			Port: publicPort,
+			IP:   net.IPv4zero,
+			Port: t.udpPort,
 		}
 
-		var err error
 		t.udpConn, err = net.ListenUDP("udp", localAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create UDP socket: %v", err)
 		}
+
+		// Start UDP listener
+		go t.handleUDPMessages()
 	}
 
 	// Start hole punching
-	_, punching := t.punchingMap.LoadOrStore(remoteAddr, true)
-	if punching {
-		return nil // Already attempting to punch hole
+	remoteUDPAddr := &net.UDPAddr{
+		IP:   net.ParseIP(host),
+		Port: port,
 	}
 
-	log.Printf("Starting hole punching to %s", remoteAddr)
+	// Send hole punching packets with increasing intervals
 	go func() {
-		defer t.punchingMap.Delete(remoteAddr)
+		intervals := []time.Duration{
+			100 * time.Millisecond,
+			200 * time.Millisecond,
+			300 * time.Millisecond,
+			500 * time.Millisecond,
+			1 * time.Second,
+		}
 
-		// Send hole punching packets
-		punchPacket := []byte("PUNCH")
-		retries := 10 // Increased retries
-		success := make(chan bool)
+		punchPacket := []byte("PUNCH:" + t.ListenAddr)
 
-		// Start response listener
-		go func() {
-			buf := make([]byte, 1024)
-			t.udpConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-			for {
-				n, addr, err := t.udpConn.ReadFromUDP(buf)
-				if err != nil {
-					continue
-				}
-				if addr.IP.String() == udpAddr.IP.String() && string(buf[:n]) == "PUNCH-ACK" {
-					success <- true
-					return
-				}
-			}
-		}()
-
-		// Send punch packets
-		for i := 0; i < retries; i++ {
-			if _, err := t.udpConn.WriteToUDP(punchPacket, udpAddr); err != nil {
-				log.Printf("Failed to send punch packet: %v", err)
-				continue
-			}
-
+		for _, interval := range intervals {
 			select {
-			case <-success:
-				log.Printf("Hole punching successful to %s", remoteAddr)
+			case <-t.punchingChan: // Connection established
 				return
-			case <-time.After(500 * time.Millisecond):
-				continue
+			default:
+				t.udpConn.WriteToUDP(punchPacket, remoteUDPAddr)
+				time.Sleep(interval)
 			}
 		}
-		log.Printf("Hole punching failed after %d attempts to %s", retries, remoteAddr)
 	}()
 
 	return nil
