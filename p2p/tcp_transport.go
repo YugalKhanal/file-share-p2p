@@ -122,24 +122,42 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
-	// Initialize NAT service if not already done
+	// Initialize NAT service
 	if err := t.natService.Initialize(t.getPort()); err != nil {
 		log.Printf("NAT service initialization failed: %v", err)
+		// Continue anyway, as we'll try direct connection
 	}
 
-	// Try hole punching first
-	if err := t.punchHole(addr); err != nil {
-		log.Printf("Hole punching failed: %v, falling back to direct connection", err)
+	// Split the address if it contains multiple options (public|private)
+	addrs := strings.Split(addr, "|")
+	var lastErr error
+
+	// Try each address
+	for _, address := range addrs {
+		// Try direct TCP connection first
+		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+		if err == nil {
+			go t.handleConn(conn, true)
+			return nil
+		}
+		lastErr = err
+
+		// If direct connection fails, try hole punching
+		if err := t.punchHole(address); err != nil {
+			log.Printf("Hole punching to %s failed: %v", address, err)
+			continue
+		}
+
+		// Try TCP connection again after hole punching
+		conn, err = net.DialTimeout("tcp", address, 5*time.Second)
+		if err == nil {
+			go t.handleConn(conn, true)
+			return nil
+		}
+		lastErr = err
 	}
 
-	// Attempt direct connection
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return err
-	}
-
-	go t.handleConn(conn, true)
-	return nil
+	return fmt.Errorf("failed to connect to any address: %v", lastErr)
 }
 
 func (t *TCPTransport) getPort() int {

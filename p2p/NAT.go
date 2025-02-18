@@ -1,6 +1,9 @@
 package p2p
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +13,7 @@ import (
 	"github.com/huin/goupnp/dcps/internetgateway2"
 )
 
+// NATType represents different NAT configurations
 type NATType int
 
 const (
@@ -20,6 +24,20 @@ const (
 	NATPortRestricted
 	NATSymmetric
 )
+
+// STUN message types and constants
+const (
+	stunBindingRequest  = 0x0001
+	stunBindingResponse = 0x0101
+	stunMagicCookie     = 0x2112A442
+)
+
+type stunMessage struct {
+	Type   uint16
+	Length uint16
+	Cookie uint32
+	TxID   [12]byte
+}
 
 type NATService struct {
 	publicIP        string
@@ -32,6 +50,108 @@ type NATService struct {
 	mutex           sync.RWMutex
 	mappedPorts     map[int]bool
 	mappedPortMutex sync.RWMutex
+}
+
+func (n *NATService) testSTUNServer(serverAddr string) error {
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return fmt.Errorf("UDP listen failed: %v", err)
+	}
+	defer conn.Close()
+
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve STUN server: %v", err)
+	}
+
+	// Create transaction ID
+	txID := make([]byte, 12)
+	if _, err := rand.Read(txID); err != nil {
+		return fmt.Errorf("failed to generate transaction ID: %v", err)
+	}
+
+	// Create STUN message
+	msg := &stunMessage{
+		Type:   stunBindingRequest,
+		Length: 0,
+		Cookie: stunMagicCookie,
+	}
+	copy(msg.TxID[:], txID)
+
+	// Encode message
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, msg); err != nil {
+		return fmt.Errorf("failed to encode STUN message: %v", err)
+	}
+
+	// Send request
+	if _, err := conn.WriteToUDP(buf.Bytes(), serverUDPAddr); err != nil {
+		return fmt.Errorf("failed to send STUN request: %v", err)
+	}
+
+	// Set read deadline
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	// Read response
+	response := make([]byte, 1024)
+	size, _, err := conn.ReadFromUDP(response)
+	if err != nil {
+		return fmt.Errorf("failed to read STUN response: %v", err)
+	}
+
+	// Parse response
+	if size < 20 {
+		return fmt.Errorf("STUN response too short")
+	}
+
+	// Verify response type
+	respType := binary.BigEndian.Uint16(response[0:2])
+	if respType != stunBindingResponse {
+		return fmt.Errorf("unexpected STUN response type: %x", respType)
+	}
+
+	// Find XOR-MAPPED-ADDRESS attribute
+	// Find XOR-MAPPED-ADDRESS attribute
+	pos := 20
+	for pos+4 <= size {
+		attrType := binary.BigEndian.Uint16(response[pos : pos+2])
+		attrLen := binary.BigEndian.Uint16(response[pos+2 : pos+4])
+
+		if attrType == 0x0020 { // XOR-MAPPED-ADDRESS
+			if pos+8 > size {
+				return fmt.Errorf("truncated XOR-MAPPED-ADDRESS")
+			}
+
+			family := binary.BigEndian.Uint16(response[pos+4 : pos+6])
+			if family != 0x01 {
+				return fmt.Errorf("unsupported address family: %d", family)
+			}
+
+			// Extract and XOR port
+			port := binary.BigEndian.Uint16(response[pos+6 : pos+8])
+			port ^= uint16(stunMagicCookie >> 16)
+
+			// Extract and XOR IP
+			ip := make(net.IP, 4)
+			cookie := make([]byte, 4)
+			binary.BigEndian.PutUint32(cookie, stunMagicCookie)
+			for i := 0; i < 4; i++ {
+				ip[i] = response[pos+8+i] ^ cookie[i]
+			}
+
+			n.mutex.Lock()
+			n.publicIP = ip.String()
+			n.publicPort = int(port)
+			n.mutex.Unlock()
+
+			log.Printf("STUN detected public endpoint: %s:%d", ip.String(), port)
+			return nil
+		}
+
+		pos += 4 + int(attrLen)
+	}
+
+	return fmt.Errorf("no XOR-MAPPED-ADDRESS found in STUN response")
 }
 
 func NewNATService(stunServers []string) *NATService {
@@ -52,22 +172,65 @@ func NewNATService(stunServers []string) *NATService {
 }
 
 func (n *NATService) Initialize(localPort int) error {
-	var err error
+	n.localPort = localPort
 
 	// Try UPnP first
-	if err = n.tryUPnP(localPort); err != nil {
+	if err := n.tryUPnP(localPort); err != nil {
 		log.Printf("UPnP failed: %v, falling back to STUN", err)
+	} else {
+		log.Printf("UPnP succeeded, public endpoint: %s:%d", n.publicIP, n.publicPort)
+		return nil
 	}
 
-	// Try STUN if UPnP failed or we still don't have a public IP
+	// Try STUN servers
+	for _, server := range n.stunServers {
+		log.Printf("Trying STUN server: %s", server)
+		if err := n.testSTUNServer(server); err != nil {
+			log.Printf("STUN server %s failed: %v", server, err)
+			continue
+		}
+		return nil
+	}
+
+	// If both UPnP and STUN fail, use local address as fallback
 	if n.publicIP == "" {
-		if err = n.detectNATType(); err != nil {
-			return fmt.Errorf("NAT detection failed: %v", err)
+		localIP, err := getLocalIP()
+		if err != nil {
+			return fmt.Errorf("failed to get local IP: %v", err)
+		}
+		n.mutex.Lock()
+		n.publicIP = localIP
+		n.publicPort = localPort
+		n.mutex.Unlock()
+		log.Printf("NAT traversal failed, using local endpoint: %s:%d", localIP, localPort)
+	}
+
+	return nil
+}
+
+// Helper function to get local IP
+func getLocalIP() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					return ipnet.IP.String(), nil
+				}
+			}
 		}
 	}
-
-	n.localPort = localPort
-	return nil
+	return "", fmt.Errorf("no suitable local IP found")
 }
 
 func (n *NATService) tryUPnP(port int) error {
@@ -131,46 +294,6 @@ func (n *NATService) detectNATType() error {
 	}
 
 	return fmt.Errorf("all STUN servers failed, last error: %v", lastErr)
-}
-
-func (n *NATService) testSTUNServer(serverAddr string) error {
-	conn, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	serverUDPAddr, err := net.ResolveUDPAddr("udp", serverAddr)
-	if err != nil {
-		return err
-	}
-
-	// Send binding request
-	if err := n.sendSTUNBindingRequest(conn, serverUDPAddr); err != nil {
-		return err
-	}
-
-	// Wait for response with timeout
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	response := make([]byte, 1024)
-	size, _, err := conn.ReadFromUDP(response)
-	if err != nil {
-		return err
-	}
-
-	// Parse STUN response
-	mappedAddr, err := n.parseSTUNResponse(response[:size])
-	if err != nil {
-		return err
-	}
-
-	n.mutex.Lock()
-	n.publicIP = mappedAddr.IP.String()
-	n.publicPort = mappedAddr.Port
-	n.mutex.Unlock()
-
-	return nil
 }
 
 func (n *NATService) GetPublicAddress() (string, int) {
