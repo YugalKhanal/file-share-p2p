@@ -134,29 +134,39 @@ func (t *TCPTransport) Dial(addr string) error {
 
 	for _, address := range addrs {
 		go func(targetAddr string) {
-			host, _, err := net.SplitHostPort(targetAddr)
+			host, portStr, err := net.SplitHostPort(targetAddr)
 			if err != nil {
 				errCh <- fmt.Errorf("invalid address %s: %v", targetAddr, err)
 				return
 			}
 
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				errCh <- fmt.Errorf("invalid port in address %s: %v", targetAddr, err)
+				return
+			}
+
+			// Create UDP address using the same port as the TCP service
 			udpAddr := &net.UDPAddr{
 				IP:   net.ParseIP(host),
-				Port: t.getPort(),
+				Port: port, // Use the port from the target address
 			}
 
 			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
 			log.Printf("Starting hole punching to %s (UDP: %s)", targetAddr, udpAddr)
 
-			// Try sending punch messages multiple times with increasing delays
+			// Send punch messages with exponential backoff
 			for i := 0; i < 5; i++ {
-				_, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
 				if err != nil {
 					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
 				} else {
-					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, 3000)
+					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
 				}
-				time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+
+				// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+				backoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
+				time.Sleep(backoff)
 			}
 
 			// Try direct TCP connection as fallback
@@ -172,6 +182,7 @@ func (t *TCPTransport) Dial(addr string) error {
 		}(address)
 	}
 
+	// Wait longer for hole punching to work
 	log.Printf("Waiting for connection success or timeout")
 	select {
 	case <-doneCh:
@@ -183,7 +194,7 @@ func (t *TCPTransport) Dial(addr string) error {
 	case err := <-errCh:
 		log.Printf("Connection error: %v", err)
 		return err
-	case <-time.After(10 * time.Second):
+	case <-time.After(20 * time.Second): // Increased timeout
 		log.Printf("Connection attempt timed out")
 		return fmt.Errorf("connection timeout")
 	}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -52,14 +53,32 @@ func (t *TCPTransport) handleUDPMessages() {
 		case "PUNCH":
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
 
-			// Send acknowledgment back
-			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
-			_, err := t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr)
+			// Extract port from punch message address
+			_, punchPortStr, err := net.SplitHostPort(tcpAddr)
 			if err != nil {
-				log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
+				log.Printf("Invalid TCP address in punch message: %v", err)
 				continue
 			}
-			log.Printf("Sent ACK to %s", remoteAddr)
+
+			punchPort, err := strconv.Atoi(punchPortStr)
+			if err != nil {
+				log.Printf("Invalid port in punch message: %v", err)
+				continue
+			}
+
+			// Send acknowledgment using the same port as the punch message
+			ackAddr := &net.UDPAddr{
+				IP:   remoteAddr.IP,
+				Port: punchPort,
+			}
+
+			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
+			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), ackAddr)
+			if err != nil {
+				log.Printf("Failed to send ACK to %s: %v", ackAddr, err)
+				continue
+			}
+			log.Printf("Sent ACK to %s", ackAddr)
 
 			// Try TCP connection after small delay
 			go func() {
