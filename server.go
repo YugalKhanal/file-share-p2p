@@ -969,14 +969,25 @@ func (s *FileServer) bootstrapNetwork() {
 }
 
 // announceToTracker sends a request to the tracker to announce this peer's file availability.
-// In server.go
 func announceToTracker(trackerAddr string, fileID string, listenAddr string, metadata *shared.Metadata) error {
 	peerAddr, err := getPeerAddress(listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to determine peer address: %v", err)
 	}
 
-	// Create announcement payload
+	// Split and deduplicate addresses
+	addrMap := make(map[string]bool)
+	for _, addr := range strings.Split(peerAddr, "|") {
+		addrMap[addr] = true
+	}
+
+	// Create a single deduplicated address string
+	var uniqueAddrs []string
+	for addr := range addrMap {
+		uniqueAddrs = append(uniqueAddrs, addr)
+	}
+	dedupedAddr := strings.Join(uniqueAddrs, "|")
+
 	announcement := struct {
 		FileID      string   `json:"file_id"`
 		PeerAddr    string   `json:"peer_addr"`
@@ -992,7 +1003,7 @@ func announceToTracker(trackerAddr string, fileID string, listenAddr string, met
 		TotalSize   int64    `json:"total_size"`
 	}{
 		FileID:      fileID,
-		PeerAddr:    peerAddr,
+		PeerAddr:    dedupedAddr,
 		Name:        filepath.Base(metadata.OriginalPath),
 		Size:        metadata.TotalSize,
 		Description: "File shared via ForeverStore",

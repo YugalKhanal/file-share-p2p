@@ -129,75 +129,80 @@ func (t *TCPTransport) Dial(addr string) error {
 	addrs := strings.Split(addr, "|")
 	log.Printf("Attempting to connect to addresses: %v", addrs)
 
-	errCh := make(chan error, len(addrs))
-	doneCh := make(chan struct{})
-
+	// Try each address
 	for _, address := range addrs {
+		// Create channels for coordination
+		successChan := make(chan struct{})
+		errChan := make(chan error)
+
 		go func(targetAddr string) {
 			host, portStr, err := net.SplitHostPort(targetAddr)
 			if err != nil {
-				errCh <- fmt.Errorf("invalid address %s: %v", targetAddr, err)
+				errChan <- fmt.Errorf("invalid address %s: %v", targetAddr, err)
 				return
 			}
 
 			port, err := strconv.Atoi(portStr)
 			if err != nil {
-				errCh <- fmt.Errorf("invalid port in address %s: %v", targetAddr, err)
+				errChan <- fmt.Errorf("invalid port in address %s: %v", targetAddr, err)
 				return
 			}
 
-			// Create UDP address using the same port as the TCP service
-			udpAddr := &net.UDPAddr{
-				IP:   net.ParseIP(host),
-				Port: port, // Use the port from the target address
-			}
-
-			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
-			log.Printf("Starting hole punching to %s (UDP: %s)", targetAddr, udpAddr)
-
-			// Send punch messages with exponential backoff
-			for i := 0; i < 5; i++ {
-				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
-				if err != nil {
-					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
-				} else {
-					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
-				}
-
-				// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
-				backoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
-				time.Sleep(backoff)
-			}
-
-			// Try direct TCP connection as fallback
+			// Try direct TCP connection first
 			log.Printf("Attempting direct TCP connection to %s", targetAddr)
 			if conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second); err == nil {
 				log.Printf("Direct TCP connection successful to %s", targetAddr)
 				go t.handleConn(conn, true)
-				close(doneCh)
+				close(successChan)
 				return
-			} else {
-				log.Printf("Direct TCP connection failed to %s: %v", targetAddr, err)
+			}
+
+			// If direct connection fails, try UDP hole punching
+			udpAddr := &net.UDPAddr{
+				IP:   net.ParseIP(host),
+				Port: port,
+			}
+
+			// Send punch messages with increasing intervals
+			intervals := []time.Duration{
+				100 * time.Millisecond,
+				200 * time.Millisecond,
+				500 * time.Millisecond,
+			}
+
+			for _, interval := range intervals {
+				punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
+				if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr); err != nil {
+					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
+					continue
+				}
+				log.Printf("Sent punch message to %s", udpAddr)
+				time.Sleep(interval)
+			}
+
+			// Wait for connection establishment
+			select {
+			case <-t.connectedCh:
+				close(successChan)
+			case <-time.After(5 * time.Second):
+				errChan <- fmt.Errorf("hole punching timeout")
 			}
 		}(address)
+
+		// Wait for success or timeout for this address
+		select {
+		case <-successChan:
+			return nil
+		case err := <-errChan:
+			log.Printf("Connection attempt failed: %v", err)
+			continue
+		case <-time.After(10 * time.Second):
+			log.Printf("Connection attempt timed out")
+			continue
+		}
 	}
 
-	// Wait longer for hole punching to work
-	log.Printf("Waiting for connection success or timeout")
-	select {
-	case <-doneCh:
-		log.Printf("Connection established via direct TCP")
-		return nil
-	case <-t.connectedCh:
-		log.Printf("Connection established via hole punching")
-		return nil
-	case err := <-errCh:
-		log.Printf("Connection error: %v", err)
-		return err
-	case <-time.After(20 * time.Second): // Increased timeout
-		log.Printf("Connection attempt timed out")
-		return fmt.Errorf("connection timeout")
-	}
+	return fmt.Errorf("failed to connect to any address")
 }
 
 func (t *TCPTransport) getPort() int {

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -53,44 +52,27 @@ func (t *TCPTransport) handleUDPMessages() {
 		case "PUNCH":
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
 
-			// Extract port from punch message address
-			_, punchPortStr, err := net.SplitHostPort(tcpAddr)
-			if err != nil {
-				log.Printf("Invalid TCP address in punch message: %v", err)
-				continue
-			}
-
-			punchPort, err := strconv.Atoi(punchPortStr)
-			if err != nil {
-				log.Printf("Invalid port in punch message: %v", err)
-				continue
-			}
-
-			// Send acknowledgment using the same port as the punch message
-			ackAddr := &net.UDPAddr{
-				IP:   remoteAddr.IP,
-				Port: punchPort,
-			}
-
-			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
-			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), ackAddr)
-			if err != nil {
-				log.Printf("Failed to send ACK to %s: %v", ackAddr, err)
-				continue
-			}
-			log.Printf("Sent ACK to %s", ackAddr)
-
-			// Try TCP connection after small delay
-			go func() {
-				time.Sleep(100 * time.Millisecond)
-				log.Printf("Attempting TCP connection to %s", tcpAddr)
-				if conn, err := net.DialTimeout("tcp", tcpAddr, 5*time.Second); err == nil {
-					log.Printf("Successfully established TCP connection to %s", tcpAddr)
-					go t.handleConn(conn, true)
+			// Try multiple connection attempts
+			for i := 0; i < 3; i++ {
+				// Send ACK
+				ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
+				if _, err := t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr); err != nil {
+					log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
 				} else {
-					log.Printf("Failed to establish TCP connection to %s: %v", tcpAddr, err)
+					log.Printf("Sent ACK to %s (attempt %d)", remoteAddr, i+1)
 				}
-			}()
+
+				// Try TCP connection
+				go func(attempt int) {
+					time.Sleep(time.Duration(attempt*100) * time.Millisecond)
+					if conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second); err == nil {
+						log.Printf("Successfully established TCP connection to %s", tcpAddr)
+						go t.handleConn(conn, true)
+					}
+				}(i)
+
+				time.Sleep(200 * time.Millisecond)
+			}
 
 		case "ACK":
 			log.Printf("Received ACK from %s for TCP address %s", remoteAddr, tcpAddr)
