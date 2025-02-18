@@ -142,32 +142,25 @@ func (t *TCPTransport) Dial(addr string) error {
 		}
 	}
 
-	// Get all possible addresses to try
-	addresses := []string{addr}
-	if t.NATService != nil {
-		t.NATService.mu.RLock()
-		if peer, ok := t.NATService.peers[addr]; ok {
-			addresses = append(addresses,
-				peer.PublicAddr.String(),
-				peer.PrivateAddr.String())
-		}
-		t.NATService.mu.RUnlock()
-	}
+	// Get public address
+	addrs := strings.Split(addr, "|")
+	publicAddr := addrs[0]
 
-	// Try each address
-	var lastErr error
-	for _, address := range addresses {
-		log.Printf("Attempting TCP connection to %s", address)
-		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+	// Multiple connection attempts with increasing delays
+	for attempt := 0; attempt < 5; attempt++ {
+		log.Printf("TCP connection attempt %d/5 to %s", attempt+1, publicAddr)
+
+		conn, err := net.DialTimeout("tcp", publicAddr, 5*time.Second)
 		if err == nil {
 			go t.handleConn(conn, true)
 			return nil
 		}
-		lastErr = err
-		time.Sleep(100 * time.Millisecond)
+
+		log.Printf("Connection attempt failed: %v", err)
+		time.Sleep(time.Duration(attempt+1) * time.Second)
 	}
 
-	return fmt.Errorf("failed to establish connection to any address: %v", lastErr)
+	return fmt.Errorf("failed to establish TCP connection after 5 attempts")
 }
 
 func (t *TCPTransport) ListenAndAccept() error {
