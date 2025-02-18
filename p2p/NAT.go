@@ -202,8 +202,13 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	log.Printf("Received hole punch message type=%s from %s", msg.Type, remoteAddr.String())
+
 	switch msg.Type {
 	case "punch":
+		log.Printf("Received punch from peer %s (public: %s, private: %s)",
+			msg.PeerID, msg.PublicAddr, msg.PrivateAddr)
+
 		// Send acknowledgment
 		response := holePunchMessage{
 			Type:        "punch_ack",
@@ -218,9 +223,12 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 			return
 		}
 
+		log.Printf("Sending punch_ack to %s", remoteAddr.String())
 		n.udpConn.WriteToUDP(data, remoteAddr)
 
 	case "punch_ack":
+		log.Printf("Received punch_ack from peer %s (public: %s, private: %s)",
+			msg.PeerID, msg.PublicAddr, msg.PrivateAddr)
 		// Update peer information
 		pubAddr, err := net.ResolveUDPAddr("udp", msg.PublicAddr)
 		if err != nil {
@@ -277,6 +285,9 @@ func (n *NATService) sendHolePunch(addr *net.UDPAddr) {
 		return
 	}
 
+	log.Printf("Sending hole punch to %s (public: %s, private: %s)",
+		addr.String(), n.publicAddr.String(), n.privateAddr.String())
+
 	if _, err := n.udpConn.WriteToUDP(data, addr); err != nil {
 		log.Printf("Failed to send hole punch to %s: %v", addr.String(), err)
 	}
@@ -292,17 +303,21 @@ func (n *NATService) InitiateConnection(peerAddr string) error {
 	}
 	n.mu.RUnlock()
 
-	// Send hole punches to all possible addresses
-	for _, addr := range addrs {
-		udpAddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			continue
+	// Send multiple hole punches to all possible addresses
+	for i := 0; i < 5; i++ { // Try 5 times
+		for _, addr := range addrs {
+			udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			if err != nil {
+				continue
+			}
+			n.sendHolePunch(udpAddr)
+			time.Sleep(100 * time.Millisecond)
 		}
-		n.sendHolePunch(udpAddr)
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	// Wait briefly for hole punch to work
-	time.Sleep(500 * time.Millisecond)
+	// Wait a bit longer for hole punch to work
+	time.Sleep(1 * time.Second)
 	return nil
 }
 
