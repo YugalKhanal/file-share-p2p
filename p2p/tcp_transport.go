@@ -119,58 +119,72 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
-	// Setup UDP listener if not already done
 	if t.udpConn == nil {
+		log.Printf("Initializing UDP listener for hole punching")
 		if err := t.setupUDPListener(); err != nil {
 			return fmt.Errorf("UDP setup failed: %v", err)
 		}
 	}
 
 	addrs := strings.Split(addr, "|")
+	log.Printf("Attempting to connect to addresses: %v", addrs)
+
 	errCh := make(chan error, len(addrs))
 	doneCh := make(chan struct{})
 
 	for _, address := range addrs {
 		go func(targetAddr string) {
-			// Parse address
 			host, _, err := net.SplitHostPort(targetAddr)
 			if err != nil {
-				errCh <- err
+				errCh <- fmt.Errorf("invalid address %s: %v", targetAddr, err)
 				return
 			}
 
 			udpAddr := &net.UDPAddr{
 				IP:   net.ParseIP(host),
-				Port: t.getPort(), // Use same port for UDP
+				Port: t.getPort(),
 			}
 
-			// Send punch message
 			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
+			log.Printf("Starting hole punching to %s (UDP: %s)", targetAddr, udpAddr)
 
-			// Try sending punch messages multiple times
+			// Try sending punch messages multiple times with increasing delays
 			for i := 0; i < 5; i++ {
-				t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+				if err != nil {
+					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
+				} else {
+					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
+				}
 				time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
 			}
 
 			// Try direct TCP connection as fallback
+			log.Printf("Attempting direct TCP connection to %s", targetAddr)
 			if conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second); err == nil {
+				log.Printf("Direct TCP connection successful to %s", targetAddr)
 				go t.handleConn(conn, true)
 				close(doneCh)
 				return
+			} else {
+				log.Printf("Direct TCP connection failed to %s: %v", targetAddr, err)
 			}
 		}(address)
 	}
 
-	// Wait for success or timeout
+	log.Printf("Waiting for connection success or timeout")
 	select {
 	case <-doneCh:
+		log.Printf("Connection established via direct TCP")
 		return nil
 	case <-t.connectedCh:
+		log.Printf("Connection established via hole punching")
 		return nil
 	case err := <-errCh:
+		log.Printf("Connection error: %v", err)
 		return err
 	case <-time.After(10 * time.Second):
+		log.Printf("Connection attempt timed out")
 		return fmt.Errorf("connection timeout")
 	}
 }
