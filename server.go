@@ -75,20 +75,38 @@ func makeServer(listenAddr, bootstrapNode, trackerAddr string) *FileServer {
 }
 
 func isPrivateIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate()
+	privateCIDRs := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+	}
+	for _, cidr := range privateCIDRs {
+		_, subnet, _ := net.ParseCIDR(cidr)
+		if subnet.Contains(ip) {
+			return true
+		}
+	}
+	return ip.IsLoopback()
 }
 
 func filterPeerList(peerList []string) []string {
 	var filtered []string
 	for _, peer := range peerList {
-		host, _, err := net.SplitHostPort(peer)
-		if err != nil {
-			continue
+		addresses := strings.Split(peer, "|")
+		for _, addr := range addresses {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				continue
+			}
+			ip := net.ParseIP(host)
+			if ip != nil && !isPrivateIP(ip) {
+				filtered = append(filtered, addr)
+			}
 		}
-		ip := net.ParseIP(host)
-		if ip != nil && !isPrivateIP(ip) {
-			filtered = append(filtered, peer)
-		}
+	}
+	if len(filtered) == 0 {
+		log.Printf("Warning: No public IP peers found, falling back to all peers")
+		return peerList // fallback to all peers
 	}
 	return filtered
 }
