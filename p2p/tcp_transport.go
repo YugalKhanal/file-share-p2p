@@ -2,7 +2,6 @@ package p2p
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -78,32 +77,22 @@ type TCPTransportOpts struct {
 	OnPeer        func(Peer) error
 }
 
+// In tcp_transport.go
+
 type TCPTransport struct {
 	TCPTransportOpts
-	listener     net.Listener
-	udpConn      *net.UDPConn
-	rpcch        chan RPC
-	bufferSize   int
-	natService   *NATService
-	punchingMap  sync.Map
-	punchingChan chan string // Channel to coordinate hole punching
-	udpPort      int         // UDP port for hole punching
+	listener    net.Listener
+	udpConn     *net.UDPConn
+	rpcch       chan RPC
+	punchingMap sync.Map
+	connectedCh chan string
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
-	// Parse the port from ListenAddr
-	_, portStr, _ := net.SplitHostPort(opts.ListenAddr)
-	port, _ := strconv.Atoi(portStr)
-
-	natService := NewNATService(nil)
-
 	return &TCPTransport{
 		TCPTransportOpts: opts,
-		rpcch:            make(chan RPC, 16384),
-		bufferSize:       128 * 1024 * 1024,
-		natService:       natService,
-		punchingChan:     make(chan string, 10),
-		udpPort:          port, // Use same port as TCP
+		rpcch:            make(chan RPC, 1024),
+		connectedCh:      make(chan string, 1),
 	}
 }
 
@@ -130,44 +119,59 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
-	// Initialize NAT service
-	if err := t.natService.Initialize(t.getPort()); err != nil {
-		log.Printf("NAT service initialization failed: %v", err)
+	// Setup UDP listener if not already done
+	if t.udpConn == nil {
+		if err := t.setupUDPListener(); err != nil {
+			return fmt.Errorf("UDP setup failed: %v", err)
+		}
 	}
 
 	addrs := strings.Split(addr, "|")
-	var lastErr error
-	successChan := make(chan struct{})
+	errCh := make(chan error, len(addrs))
+	doneCh := make(chan struct{})
 
 	for _, address := range addrs {
-		go func(addr string) {
-			// Start hole punching
-			if err := t.punchHole(addr); err != nil {
-				log.Printf("Hole punching setup failed for %s: %v", addr, err)
+		go func(targetAddr string) {
+			// Parse address
+			host, _, err := net.SplitHostPort(targetAddr)
+			if err != nil {
+				errCh <- err
 				return
 			}
 
-			// Wait for punch response or timeout
-			select {
-			case <-t.punchingChan:
-				// Hole punching succeeded, connection will be handled by handleUDPMessages
-				successChan <- struct{}{}
-			case <-time.After(5 * time.Second):
-				// Try direct TCP connection as fallback
-				if conn, err := net.DialTimeout("tcp", addr, 5*time.Second); err == nil {
-					go t.handleConn(conn, true)
-					successChan <- struct{}{}
-				}
+			udpAddr := &net.UDPAddr{
+				IP:   net.ParseIP(host),
+				Port: t.getPort(), // Use same port for UDP
+			}
+
+			// Send punch message
+			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
+
+			// Try sending punch messages multiple times
+			for i := 0; i < 5; i++ {
+				t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+				time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+			}
+
+			// Try direct TCP connection as fallback
+			if conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second); err == nil {
+				go t.handleConn(conn, true)
+				close(doneCh)
+				return
 			}
 		}(address)
 	}
 
-	// Wait for any successful connection
+	// Wait for success or timeout
 	select {
-	case <-successChan:
+	case <-doneCh:
 		return nil
+	case <-t.connectedCh:
+		return nil
+	case err := <-errCh:
+		return err
 	case <-time.After(10 * time.Second):
-		return fmt.Errorf("failed to connect to any address: %v", lastErr)
+		return fmt.Errorf("connection timeout")
 	}
 }
 
@@ -182,28 +186,30 @@ func (t *TCPTransport) getPort() int {
 
 func (t *TCPTransport) ListenAndAccept() error {
 	var err error
-
 	t.listener, err = net.Listen("tcp", t.ListenAddr)
 	if err != nil {
 		return err
 	}
 
+	// Setup UDP listener
+	if err := t.setupUDPListener(); err != nil {
+		t.listener.Close()
+		return err
+	}
+
 	go t.startAcceptLoop()
-
-	log.Printf("TCP transport listening on port: %s\n", t.ListenAddr)
-
 	return nil
 }
 
 func (t *TCPTransport) startAcceptLoop() {
 	for {
 		conn, err := t.listener.Accept()
-		if errors.Is(err, net.ErrClosed) {
-			return
-		}
-
 		if err != nil {
-			fmt.Printf("TCP accept error: %s\n", err)
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+			log.Printf("Accept error: %v", err)
+			continue
 		}
 
 		go t.handleConn(conn, false)

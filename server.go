@@ -49,12 +49,11 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 		HandshakeFunc: p2p.NOPHandshakeFunc,
 		Decoder:       p2p.DefaultDecoder{},
 	}
+
 	transport := p2p.NewTCPTransport(tcpOpts)
 
 	opts := FileServerOpts{
-		ListenAddr: listenAddr,
-		// ListenAddr:        "localhost:3000",
-		EncKey:            newEncryptionKey(),
+		ListenAddr:        listenAddr,
 		StorageRoot:       "shared_files",
 		PathTransformFunc: DefaultPathTransformFunc,
 		Transport:         transport,
