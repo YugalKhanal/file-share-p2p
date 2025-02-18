@@ -208,7 +208,9 @@ type holePunchMessage struct {
 
 func (n *NATService) maintainConnections() {
 	ticker := time.NewTicker(udpKeepAliveInterval)
+	cleanupTicker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	defer cleanupTicker.Stop()
 
 	for {
 		select {
@@ -217,11 +219,26 @@ func (n *NATService) maintainConnections() {
 		case <-ticker.C:
 			n.mu.RLock()
 			for _, peer := range n.peers {
-				// Send hole punch to both addresses
-				n.sendHolePunch(peer.PublicAddr)
-				n.sendHolePunch(peer.PrivateAddr)
+				if time.Since(peer.LastSeen) < time.Minute*2 {
+					n.sendHolePunch(peer.PublicAddr)
+					n.sendHolePunch(peer.PrivateAddr)
+				}
 			}
 			n.mu.RUnlock()
+		case <-cleanupTicker.C:
+			n.cleanupStaleConnections()
+		}
+	}
+}
+
+func (n *NATService) cleanupStaleConnections() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for id, peer := range n.peers {
+		if time.Since(peer.LastSeen) > time.Minute*2 {
+			delete(n.peers, id)
+			log.Printf("Removed stale peer connection: %s", id)
 		}
 	}
 }
@@ -268,27 +285,29 @@ func (n *NATService) InitiateConnection(peerAddr string) error {
 
 	// Start listening for acknowledgments
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
+		// More controlled hole punching attempts
+		attempts := 10 // Reduce number of attempts
+		interval := 200 * time.Millisecond
 
-		for i := 0; i < 50; i++ { // More attempts, shorter intervals
-			select {
-			case <-ticker.C:
-				n.mu.RLock()
-				_, established := n.peers[publicAddr]
-				n.mu.RUnlock()
+		for i := 0; i < attempts; i++ {
+			n.mu.RLock()
+			_, established := n.peers[publicAddr]
+			n.mu.RUnlock()
 
-				if established {
-					success <- true
-					return
-				}
-
-				// Send multiple punches in quick succession
-				for j := 0; j < 5; j++ {
-					n.sendHolePunch(udpAddr)
-					time.Sleep(20 * time.Millisecond)
-				}
+			if established {
+				success <- true
+				return
 			}
+
+			// Send a burst of 3 hole punch messages with short delays
+			for j := 0; j < 3; j++ {
+				n.sendHolePunch(udpAddr)
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			time.Sleep(interval)
+			// Increase interval exponentially
+			interval = time.Duration(float64(interval) * 1.5)
 		}
 		success <- false
 	}()
@@ -315,7 +334,7 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 
 	switch msg.Type {
 	case "punch":
-		// Send multiple acknowledgments with different timing
+		// Send immediate acknowledgment with exponential backoff retries
 		go func() {
 			response := holePunchMessage{
 				Type:        "punch_ack",
@@ -330,13 +349,18 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 				return
 			}
 
-			// Send multiple waves of acknowledgments
-			for i := 0; i < 5; i++ {
-				for j := 0; j < 3; j++ {
-					n.udpConn.WriteToUDP(data, remoteAddr)
-					time.Sleep(20 * time.Millisecond)
-				}
-				time.Sleep(100 * time.Millisecond)
+			// Send 3 quick responses initially
+			for i := 0; i < 3; i++ {
+				n.udpConn.WriteToUDP(data, remoteAddr)
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			// Then a few more with increasing delays
+			delay := 200 * time.Millisecond
+			for i := 0; i < 3; i++ {
+				time.Sleep(delay)
+				n.udpConn.WriteToUDP(data, remoteAddr)
+				delay *= 2
 			}
 		}()
 
@@ -353,6 +377,7 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 			return
 		}
 
+		// Store both addresses
 		n.peers[msg.PeerID] = &PeerEndpoint{
 			ID:          msg.PeerID,
 			PublicAddr:  pubAddr,
@@ -360,7 +385,7 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 			LastSeen:    time.Now(),
 		}
 
-		// Immediately send acknowledgment back
+		// Send confirmation
 		response := holePunchMessage{
 			Type:        "punch_ack",
 			PeerID:      n.tcpTransport.ListenAddr,
