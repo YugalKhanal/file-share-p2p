@@ -150,11 +150,11 @@ func (t *TCPTransport) Dial(addr string) error {
 
 			// Try sending punch messages multiple times with increasing delays
 			for i := 0; i < 5; i++ {
-				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+				_, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
 				if err != nil {
 					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
 				} else {
-					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
+					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, 3000)
 				}
 				time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
 			}
