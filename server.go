@@ -43,12 +43,11 @@ type FileServer struct {
 	activeFilesMu    sync.RWMutex
 }
 
-func makeServer(listenAddr, bootstrapNode, trackerAddr string) *FileServer {
+func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	tcpOpts := p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
 		HandshakeFunc: p2p.NOPHandshakeFunc,
 		Decoder:       p2p.DefaultDecoder{},
-		TrackerAddr:   trackerAddr,
 	}
 	transport := p2p.NewTCPTransport(tcpOpts)
 

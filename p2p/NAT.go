@@ -1,446 +1,297 @@
 package p2p
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/anthdm/foreverstore/shared"
-	"github.com/pion/stun"
+	"github.com/huin/goupnp/dcps/internetgateway2"
 )
+
+type NATType int
 
 const (
-	udpKeepAliveInterval = 15 * time.Second
-	natCheckTimeout      = 10 * time.Second
-	publicSTUNServer     = "stun.l.google.com:19302"
+	NATUnknown NATType = iota
+	NATNone
+	NATFull
+	NATRestricted
+	NATPortRestricted
+	NATSymmetric
 )
 
-// PeerEndpoint represents connection information for a peer
-type PeerEndpoint struct {
-	ID          string
-	PublicAddr  *net.UDPAddr
-	PrivateAddr *net.UDPAddr
-	LastSeen    time.Time
-}
-
-// NATService handles NAT traversal functionality
 type NATService struct {
-	publicAddr   *net.UDPAddr
-	privateAddr  *net.UDPAddr
-	udpConn      *net.UDPConn
-	tcpTransport *TCPTransport
-	peers        map[string]*PeerEndpoint
-	mu           sync.RWMutex
-	stunClient   *stun.Client
-	trackerAddr  string
-	closeChan    chan struct{}
+	publicIP        string
+	publicPort      int
+	localIP         string
+	localPort       int
+	natType         NATType
+	stunServers     []string
+	upnpEnabled     bool
+	mutex           sync.RWMutex
+	mappedPorts     map[int]bool
+	mappedPortMutex sync.RWMutex
 }
 
-// NewNATService creates a new NAT traversal service
-func NewNATService(tcpTransport *TCPTransport, trackerAddr string) (*NATService, error) {
-	// Get local IP first
-	localIP, err := shared.GetLocalIP()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get local IP: %v", err)
+func NewNATService(stunServers []string) *NATService {
+	if len(stunServers) == 0 {
+		stunServers = []string{
+			"stun.l.google.com:19302",
+			"stun1.l.google.com:19302",
+			"stun2.l.google.com:19302",
+		}
 	}
 
-	// Create UDP listener bound to local IP
-	udpAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:0", localIP))
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve UDP address: %v", err)
+	return &NATService{
+		stunServers: stunServers,
+		upnpEnabled: true,
+		mappedPorts: make(map[int]bool),
+		natType:     NATUnknown,
 	}
-
-	conn, err := net.ListenUDP("udp4", udpAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create UDP listener: %v", err)
-	}
-
-	service := &NATService{
-		tcpTransport: tcpTransport,
-		udpConn:      conn,
-		peers:        make(map[string]*PeerEndpoint),
-		trackerAddr:  trackerAddr,
-		closeChan:    make(chan struct{}),
-	}
-
-	// Create STUN client with our UDP connection
-	client, err := stun.NewClient(conn)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create STUN client: %v", err)
-	}
-	service.stunClient = client
-
-	// Start NAT detection
-	if err := service.detectNAT(); err != nil {
-		conn.Close()
-		client.Close()
-		return nil, fmt.Errorf("NAT detection failed: %v", err)
-	}
-
-	// Start UDP message handling
-	go service.handleUDP()
-	go service.maintainConnections()
-
-	return service, nil
 }
 
-func (n *NATService) detectNAT() error {
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), natCheckTimeout)
-	defer cancel()
+func (n *NATService) Initialize(localPort int) error {
+	var err error
 
-	// Create a channel for the result
-	resultChan := make(chan error, 1)
+	// Try UPnP first
+	if err = n.tryUPnP(localPort); err != nil {
+		log.Printf("UPnP failed: %v, falling back to STUN", err)
+	}
 
-	n.mu.Lock()
-	localAddr := n.udpConn.LocalAddr().(*net.UDPAddr)
-	n.privateAddr = localAddr
-	n.mu.Unlock()
-
-	go func() {
-		// Create STUN message
-		message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-
-		// Connect to STUN server
-		c, err := stun.Dial("udp4", publicSTUNServer)
-		if err != nil {
-			resultChan <- fmt.Errorf("failed to connect to STUN server: %v", err)
-			return
+	// Try STUN if UPnP failed or we still don't have a public IP
+	if n.publicIP == "" {
+		if err = n.detectNATType(); err != nil {
+			return fmt.Errorf("NAT detection failed: %v", err)
 		}
-		defer c.Close()
+	}
 
-		// Send binding request and wait for response
-		if err := c.Do(message, func(res stun.Event) {
-			if res.Error != nil {
-				resultChan <- res.Error
-				return
-			}
+	n.localPort = localPort
+	return nil
+}
 
-			// Get XOR-MAPPED-ADDRESS from STUN response
-			var xorAddr stun.XORMappedAddress
-			if err := xorAddr.GetFrom(res.Message); err != nil {
-				resultChan <- err
-				return
-			}
+func (n *NATService) tryUPnP(port int) error {
+	if !n.upnpEnabled {
+		return fmt.Errorf("UPnP disabled")
+	}
 
-			// Store the public address
-			n.mu.Lock()
-			n.publicAddr = &net.UDPAddr{
-				IP:   xorAddr.IP,
-				Port: xorAddr.Port,
-			}
-			n.mu.Unlock()
-
-			log.Printf("NAT Detection - Public: %s, Private: %s",
-				n.publicAddr.String(), n.privateAddr.String())
-
-			resultChan <- nil
-		}); err != nil {
-			resultChan <- err
-			return
-		}
-	}()
-
-	// Wait for result or timeout
-	select {
-	case err := <-resultChan:
+	clients, errors, err := internetgateway2.NewWANIPConnection1Clients()
+	if err != nil {
 		return err
-	case <-ctx.Done():
-		return fmt.Errorf("NAT detection timed out")
 	}
-}
 
-func (n *NATService) handleUDP() {
-	buffer := make([]byte, 2048)
-	for {
-		select {
-		case <-n.closeChan:
-			return
-		default:
-			n.udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			size, remoteAddr, err := n.udpConn.ReadFromUDP(buffer)
-			if err != nil {
-				if !isTimeout(err) {
-					log.Printf("UDP read error from %v: %v", remoteAddr, err)
-				}
-				continue
-			}
-
-			// Log raw packet for debugging
-			log.Printf("Received UDP packet of size %d from %s", size, remoteAddr.String())
-
-			// Handle hole punch messages
-			var msg holePunchMessage
-			if err := json.Unmarshal(buffer[:size], &msg); err != nil {
-				log.Printf("Failed to unmarshal hole punch message from %s: %v\nPayload: %s",
-					remoteAddr, err, string(buffer[:size]))
-				continue
-			}
-
-			// Calculate latency
-			latency := time.Since(msg.Timestamp)
-			log.Printf("Received hole punch message type=%s from %s (latency: %v)",
-				msg.Type, remoteAddr.String(), latency)
-
-			go n.handleHolePunchMessage(msg, remoteAddr)
+	for i, client := range clients {
+		if errors[i] != nil {
+			continue
 		}
-	}
-}
 
-func (n *NATService) handleSTUNMessage(e stun.Event) {
-	if e.Error != nil {
-		log.Printf("STUN error: %v", e.Error)
-		return
-	}
-
-	var xorAddr stun.XORMappedAddress
-	if err := xorAddr.GetFrom(e.Message); err != nil {
-		log.Printf("Failed to get address from STUN message: %v", err)
-		return
-	}
-
-	log.Printf("Received STUN mapping: %s", xorAddr.String())
-}
-
-type holePunchMessage struct {
-	Type        string    `json:"type"`
-	PeerID      string    `json:"peer_id"`
-	PublicAddr  string    `json:"public_addr"`
-	PrivateAddr string    `json:"private_addr"`
-	Timestamp   time.Time `json:"timestamp"`
-	Sequence    int       `json:"sequence"`
-}
-
-func (n *NATService) maintainConnections() {
-	ticker := time.NewTicker(udpKeepAliveInterval)
-	cleanupTicker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	defer cleanupTicker.Stop()
-
-	for {
-		select {
-		case <-n.closeChan:
-			return
-		case <-ticker.C:
-			n.mu.RLock()
-			for _, peer := range n.peers {
-				if time.Since(peer.LastSeen) < time.Minute*2 {
-					n.sendHolePunch(peer.PublicAddr)
-					n.sendHolePunch(peer.PrivateAddr)
-				}
-			}
-			n.mu.RUnlock()
-		case <-cleanupTicker.C:
-			n.cleanupStaleConnections()
+		// Get external IP
+		ip, err := client.GetExternalIPAddress()
+		if err != nil {
+			continue
 		}
-	}
-}
 
-func (n *NATService) cleanupStaleConnections() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+		// Add port mapping
+		err = client.AddPortMapping(
+			"",
+			uint16(port),
+			"UDP",
+			uint16(port),
+			ip,
+			true,
+			"ForeverStore P2P",
+			0,
+		)
+		if err == nil {
+			n.mutex.Lock()
+			n.publicIP = ip
+			n.publicPort = port
+			n.mutex.Unlock()
 
-	for id, peer := range n.peers {
-		if time.Since(peer.LastSeen) > time.Minute*2 {
-			delete(n.peers, id)
-			log.Printf("Removed stale peer connection: %s", id)
-		}
-	}
-}
+			n.mappedPortMutex.Lock()
+			n.mappedPorts[port] = true
+			n.mappedPortMutex.Unlock()
 
-func (n *NATService) sendHolePunch(addr *net.UDPAddr) {
-	msg := holePunchMessage{
-		Type:        "punch",
-		PeerID:      n.tcpTransport.ListenAddr,
-		PublicAddr:  n.publicAddr.String(),
-		PrivateAddr: n.privateAddr.String(),
-	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("Failed to marshal hole punch message: %v", err)
-		return
-	}
-
-	log.Printf("Sending hole punch to %s (public: %s, private: %s)",
-		addr.String(), n.publicAddr.String(), n.privateAddr.String())
-
-	if _, err := n.udpConn.WriteToUDP(data, addr); err != nil {
-		log.Printf("Failed to send hole punch to %s: %v", addr.String(), err)
-	}
-}
-
-// NAT.go
-func (n *NATService) InitiateConnection(peerAddr string) error {
-	addrs := strings.Split(peerAddr, "|")
-	if len(addrs) == 0 {
-		return fmt.Errorf("invalid peer address format")
-	}
-
-	publicAddr := addrs[0]
-	log.Printf("Initiating NAT traversal to peer %s", publicAddr)
-
-	udpAddr, err := net.ResolveUDPAddr("udp", publicAddr)
-	if err != nil {
-		return fmt.Errorf("failed to resolve peer address: %v", err)
-	}
-
-	success := make(chan bool, 1)
-	sequence := 0
-
-	go func() {
-		attempts := 10
-		interval := 200 * time.Millisecond
-
-		for i := 0; i < attempts; i++ {
-			n.mu.RLock()
-			_, established := n.peers[publicAddr]
-			n.mu.RUnlock()
-
-			if established {
-				success <- true
-				return
-			}
-
-			msg := holePunchMessage{
-				Type:        "punch",
-				PeerID:      n.tcpTransport.ListenAddr,
-				PublicAddr:  n.publicAddr.String(),
-				PrivateAddr: n.privateAddr.String(),
-				Timestamp:   time.Now(),
-				Sequence:    sequence,
-			}
-			sequence++
-
-			data, err := json.Marshal(msg)
-			if err != nil {
-				log.Printf("Failed to marshal hole punch message: %v", err)
-				return
-			}
-
-			_, err = n.udpConn.WriteToUDP(data, udpAddr)
-			if err != nil {
-				log.Printf("Failed to send hole punch to %s: %v", udpAddr.String(), err)
-			}
-
-			time.Sleep(interval)
-			interval = time.Duration(float64(interval) * 1.5)
-		}
-		success <- false
-	}()
-
-	select {
-	case result := <-success:
-		if result {
-			log.Printf("NAT traversal successful to %s", publicAddr)
 			return nil
 		}
-	case <-time.After(5 * time.Second):
-		log.Printf("NAT traversal timed out to %s", publicAddr)
 	}
 
-	return fmt.Errorf("NAT traversal failed, falling back to TCP")
+	return fmt.Errorf("no working UPnP gateway found")
 }
 
-func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *net.UDPAddr) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+func (n *NATService) detectNATType() error {
+	var lastErr error
 
-	log.Printf("Processing hole punch message: type=%s from=%s seq=%d",
-		msg.Type, remoteAddr.String(), msg.Sequence)
+	for _, server := range n.stunServers {
+		if err := n.testSTUNServer(server); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
 
-	switch msg.Type {
-	case "punch":
-		go func() {
-			response := holePunchMessage{
-				Type:        "punch_ack",
-				PeerID:      n.tcpTransport.ListenAddr,
-				PublicAddr:  n.publicAddr.String(),
-				PrivateAddr: n.privateAddr.String(),
-				Timestamp:   time.Now(),
-				Sequence:    msg.Sequence, // Echo back the sequence
-			}
+	return fmt.Errorf("all STUN servers failed, last error: %v", lastErr)
+}
 
-			data, err := json.Marshal(response)
-			if err != nil {
-				log.Printf("Failed to marshal punch response: %v", err)
-				return
-			}
+func (n *NATService) testSTUNServer(serverAddr string) error {
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
-			// Send acknowledgments with increasing delays
-			delays := []time.Duration{
-				0,
-				50 * time.Millisecond,
-				100 * time.Millisecond,
-				200 * time.Millisecond,
-				400 * time.Millisecond,
-			}
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return err
+	}
 
-			for _, delay := range delays {
-				time.Sleep(delay)
-				if _, err := n.udpConn.WriteToUDP(data, remoteAddr); err != nil {
-					log.Printf("Failed to send punch_ack: %v", err)
-					return
-				}
-				log.Printf("Sent punch_ack to %s (delay=%v)", remoteAddr.String(), delay)
-			}
-		}()
+	// Send binding request
+	if err := n.sendSTUNBindingRequest(conn, serverUDPAddr); err != nil {
+		return err
+	}
 
-	case "punch_ack":
-		pubAddr, err := net.ResolveUDPAddr("udp", msg.PublicAddr)
+	// Wait for response with timeout
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	response := make([]byte, 1024)
+	size, _, err := conn.ReadFromUDP(response)
+	if err != nil {
+		return err
+	}
+
+	// Parse STUN response
+	mappedAddr, err := n.parseSTUNResponse(response[:size])
+	if err != nil {
+		return err
+	}
+
+	n.mutex.Lock()
+	n.publicIP = mappedAddr.IP.String()
+	n.publicPort = mappedAddr.Port
+	n.mutex.Unlock()
+
+	return nil
+}
+
+func (n *NATService) GetPublicAddress() (string, int) {
+	n.mutex.RLock()
+	defer n.mutex.RUnlock()
+	return n.publicIP, n.publicPort
+}
+
+func (n *NATService) sendSTUNBindingRequest(conn *net.UDPConn, serverAddr *net.UDPAddr) error {
+	// Simple STUN binding request
+	request := []byte{0x00, 0x01, 0x00, 0x00, // Message type and length
+		0x21, 0x12, 0xA4, 0x42, // Magic cookie
+		0x00, 0x00, 0x00, 0x00, // Transaction ID
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00}
+
+	_, err := conn.WriteToUDP(request, serverAddr)
+	return err
+}
+
+func (t *TCPTransport) punchHole(remoteAddr string) error {
+	// Parse the remote address
+	udpAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		return fmt.Errorf("invalid remote address: %v", err)
+	}
+
+	// Create local UDP socket if it doesn't exist
+	if t.udpConn == nil {
+		localAddr, err := net.ResolveUDPAddr("udp", t.ListenAddr)
 		if err != nil {
-			log.Printf("Failed to resolve peer public address: %v", err)
-			return
+			return fmt.Errorf("failed to resolve local address: %v", err)
 		}
 
-		privAddr, err := net.ResolveUDPAddr("udp", msg.PrivateAddr)
+		t.udpConn, err = net.ListenUDP("udp", localAddr)
 		if err != nil {
-			log.Printf("Failed to resolve peer private address: %v", err)
-			return
+			return fmt.Errorf("failed to create UDP socket: %v", err)
 		}
-
-		// Store both addresses
-		n.peers[msg.PeerID] = &PeerEndpoint{
-			ID:          msg.PeerID,
-			PublicAddr:  pubAddr,
-			PrivateAddr: privAddr,
-			LastSeen:    time.Now(),
-		}
-
-		// Send confirmation
-		response := holePunchMessage{
-			Type:        "punch_ack",
-			PeerID:      n.tcpTransport.ListenAddr,
-			PublicAddr:  n.publicAddr.String(),
-			PrivateAddr: n.privateAddr.String(),
-		}
-
-		if data, err := json.Marshal(response); err == nil {
-			n.udpConn.WriteToUDP(data, remoteAddr)
-		}
-
-		log.Printf("Received punch_ack from %s for sequence %d", remoteAddr.String(), msg.Sequence)
-		log.Printf("Successfully established NAT traversal with peer %s", msg.PeerID)
 	}
+
+	// Start hole punching
+	_, punching := t.punchingMap.LoadOrStore(remoteAddr, true)
+	if punching {
+		return nil // Already attempting to punch hole
+	}
+
+	go func() {
+		defer t.punchingMap.Delete(remoteAddr)
+
+		// Send hole punching packets
+		punchPacket := []byte("PUNCH")
+		retries := 5
+		for i := 0; i < retries; i++ {
+			t.udpConn.WriteToUDP(punchPacket, udpAddr)
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+
+	return nil
 }
 
-func (n *NATService) Close() error {
-	close(n.closeChan)
-	if n.stunClient != nil {
-		n.stunClient.Close()
+func (n *NATService) parseSTUNResponse(response []byte) (*net.UDPAddr, error) {
+	if len(response) < 20 {
+		return nil, fmt.Errorf("response too short")
 	}
-	return n.udpConn.Close()
+
+	// Skip header (20 bytes) and parse attributes
+	pos := 20
+	for pos+4 <= len(response) {
+		attrType := uint16(response[pos])<<8 | uint16(response[pos+1])
+		attrLen := uint16(response[pos+2])<<8 | uint16(response[pos+3])
+
+		if attrType == 0x0001 { // XOR-MAPPED-ADDRESS
+			if pos+8 > len(response) {
+				return nil, fmt.Errorf("invalid XOR-MAPPED-ADDRESS")
+			}
+
+			port := uint16(response[pos+6])<<8 | uint16(response[pos+7])
+			port ^= 0x2112 // XOR with magic cookie
+
+			ip := make(net.IP, 4)
+			for i := 0; i < 4; i++ {
+				ip[i] = response[pos+8+i] ^ response[4+i]
+			}
+
+			return &net.UDPAddr{
+				IP:   ip,
+				Port: int(port),
+			}, nil
+		}
+
+		pos += 4 + int(attrLen)
+	}
+
+	return nil, fmt.Errorf("no XOR-MAPPED-ADDRESS found")
 }
 
-func isTimeout(err error) bool {
-	if netErr, ok := err.(net.Error); ok {
-		return netErr.Timeout()
+func (n *NATService) Cleanup() {
+	if !n.upnpEnabled {
+		return
 	}
-	return false
+
+	clients, errors, err := internetgateway2.NewWANIPConnection1Clients()
+	if err != nil {
+		return
+	}
+
+	n.mappedPortMutex.RLock()
+	ports := make([]int, 0, len(n.mappedPorts))
+	for port := range n.mappedPorts {
+		ports = append(ports, port)
+	}
+	n.mappedPortMutex.RUnlock()
+
+	for i, client := range clients {
+		if errors[i] != nil {
+			continue
+		}
+
+		for _, port := range ports {
+			client.DeletePortMapping("", uint16(port), "UDP")
+		}
+	}
 }

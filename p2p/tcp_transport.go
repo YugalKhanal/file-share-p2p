@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -75,35 +76,27 @@ type TCPTransportOpts struct {
 	HandshakeFunc HandshakeFunc
 	Decoder       Decoder
 	OnPeer        func(Peer) error
-	TrackerAddr   string
 }
 
 type TCPTransport struct {
 	TCPTransportOpts
-	listener   net.Listener
-	rpcch      chan RPC
-	bufferSize int //adding buffer size for large downloads
-	NATService *NATService
+	listener    net.Listener
+	udpConn     *net.UDPConn
+	rpcch       chan RPC
+	bufferSize  int
+	natService  *NATService
+	punchingMap sync.Map // tracks ongoing hole punching attempts
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
-	t := &TCPTransport{
+	natService := NewNATService(nil) // Use default STUN servers
+
+	return &TCPTransport{
 		TCPTransportOpts: opts,
 		rpcch:            make(chan RPC, 16384),
 		bufferSize:       128 * 1024 * 1024,
+		natService:       natService,
 	}
-
-	// Initialize NAT service if tracker address is provided
-	if opts.TrackerAddr != "" {
-		natService, err := NewNATService(t, opts.TrackerAddr)
-		if err != nil {
-			log.Printf("Warning: Failed to initialize NAT service: %v", err)
-		} else {
-			t.NATService = natService
-		}
-	}
-
-	return t
 }
 
 // Addr implements the Transport interface return the address
@@ -120,13 +113,7 @@ func (t *TCPTransport) Consume() <-chan RPC {
 
 // Close implements the Transport interface.
 func (t *TCPTransport) Close() error {
-	if t.NATService != nil {
-		t.NATService.Close()
-	}
-	if t.listener != nil {
-		return t.listener.Close()
-	}
-	return nil
+	return t.listener.Close()
 }
 
 func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
@@ -135,34 +122,33 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
-	if t.NATService != nil {
-		// Attempt NAT traversal
-		err := t.NATService.InitiateConnection(addr)
-		if err == nil {
-			return nil
-		}
-		log.Printf("NAT traversal failed for %s: %v", addr, err)
+	// Initialize NAT service if not already done
+	if err := t.natService.Initialize(t.getPort()); err != nil {
+		log.Printf("NAT service initialization failed: %v", err)
 	}
 
-	// Get public address
-	addrs := strings.Split(addr, "|")
-	publicAddr := addrs[0]
-
-	// Multiple connection attempts with increasing delays
-	for attempt := 0; attempt < 3; attempt++ {
-		log.Printf("TCP connection attempt %d/3 to %s", attempt+1, publicAddr)
-
-		conn, err := net.DialTimeout("tcp", publicAddr, 5*time.Second)
-		if err == nil {
-			go t.handleConn(conn, true)
-			return nil
-		}
-
-		log.Printf("Connection attempt failed: %v", err)
-		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	// Try hole punching first
+	if err := t.punchHole(addr); err != nil {
+		log.Printf("Hole punching failed: %v, falling back to direct connection", err)
 	}
 
-	return fmt.Errorf("failed to establish connection after 3 attempts")
+	// Attempt direct connection
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return err
+	}
+
+	go t.handleConn(conn, true)
+	return nil
+}
+
+func (t *TCPTransport) getPort() int {
+	parts := strings.Split(t.ListenAddr, ":")
+	if len(parts) != 2 {
+		return 0
+	}
+	port, _ := strconv.Atoi(parts[1])
+	return port
 }
 
 func (t *TCPTransport) ListenAndAccept() error {
@@ -315,5 +301,3 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 
 	close(heartbeatCh)
 }
-
-// Update the Send method in TCPPeer
