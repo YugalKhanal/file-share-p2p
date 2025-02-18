@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"math/rand/v2"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -74,46 +73,16 @@ func makeServer(listenAddr, bootstrapNode, trackerAddr string) *FileServer {
 	return server
 }
 
-// Fetches the public IP address of the server
-// Add this to the utility functions
-func getPublicIP() (string, error) {
-	resp, err := http.Get("https://api.ipify.org?format=text")
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	ip, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(ip), nil
-}
-
-func getLocalIP() (string, error) {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "", err
-	}
-
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-			return ipNet.IP.String(), nil
-		}
-	}
-	return "", fmt.Errorf("no local IP found")
-}
 
 // Determines the peer's full address, combining the detected IP with the listening port
 func getPeerAddress(listenAddr string) (string, error) {
 	// Get both public and local IPs
-	publicIP, err := getPublicIP()
+	publicIP, err := shared.GetPublicIP()
 	if err != nil {
 		return "", fmt.Errorf("failed to get public IP: %v", err)
 	}
 
-	localIP, err := getLocalIP()
+	localIP, err := shared.GetLocalIP()
 	if err != nil {
 		return "", fmt.Errorf("failed to get local IP: %v", err)
 	}

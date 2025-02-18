@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthdm/foreverstore/shared"
 	"github.com/pion/stun"
 )
 
@@ -42,8 +43,14 @@ type NATService struct {
 
 // NewNATService creates a new NAT traversal service
 func NewNATService(tcpTransport *TCPTransport, trackerAddr string) (*NATService, error) {
-	// Create UDP listener on random port
-	udpAddr, err := net.ResolveUDPAddr("udp4", ":0")
+	// Get local IP first
+	localIP, err := shared.GetLocalIP()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local IP: %v", err)
+	}
+
+	// Create UDP listener bound to local IP
+	udpAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:0", localIP))
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve UDP address: %v", err)
 	}
@@ -244,8 +251,11 @@ func (n *NATService) sendHolePunch(addr *net.UDPAddr) {
 func (n *NATService) InitiateConnection(peerAddr string) error {
 	// Parse the addresses (they're in format "public|private")
 	addrs := strings.Split(peerAddr, "|")
-	publicAddr := addrs[0] // Use only the public address
+	if len(addrs) == 0 {
+		return fmt.Errorf("invalid peer address format")
+	}
 
+	publicAddr := addrs[0]
 	log.Printf("Initiating NAT traversal to peer %s", publicAddr)
 
 	udpAddr, err := net.ResolveUDPAddr("udp", publicAddr)
@@ -253,30 +263,48 @@ func (n *NATService) InitiateConnection(peerAddr string) error {
 		return fmt.Errorf("failed to resolve peer address: %v", err)
 	}
 
-	// Send more aggressive hole punches
-	for i := 0; i < 10; i++ {
-		log.Printf("Hole punch attempt %d/10 to %s", i+1, publicAddr)
+	// Create a channel to signal success
+	success := make(chan bool, 1)
 
-		// Send multiple punches in quick succession
-		for j := 0; j < 3; j++ {
-			n.sendHolePunch(udpAddr)
-			time.Sleep(50 * time.Millisecond)
+	// Start listening for acknowledgments
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for i := 0; i < 50; i++ { // More attempts, shorter intervals
+			select {
+			case <-ticker.C:
+				n.mu.RLock()
+				_, established := n.peers[publicAddr]
+				n.mu.RUnlock()
+
+				if established {
+					success <- true
+					return
+				}
+
+				// Send multiple punches in quick succession
+				for j := 0; j < 5; j++ {
+					n.sendHolePunch(udpAddr)
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
 		}
+		success <- false
+	}()
 
-		// Check if we've received an acknowledgment
-		n.mu.RLock()
-		_, established := n.peers[publicAddr]
-		n.mu.RUnlock()
-
-		if established {
+	// Wait for success or timeout
+	select {
+	case result := <-success:
+		if result {
 			log.Printf("NAT traversal successful to %s", publicAddr)
 			return nil
 		}
-
-		time.Sleep(200 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		// Continue with TCP fallback
 	}
 
-	return fmt.Errorf("failed to establish NAT traversal after 10 attempts")
+	return fmt.Errorf("NAT traversal failed, falling back to TCP")
 }
 
 func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *net.UDPAddr) {
@@ -287,10 +315,52 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 
 	switch msg.Type {
 	case "punch":
-		log.Printf("Received punch from peer %s (public: %s, private: %s)",
-			msg.PeerID, msg.PublicAddr, msg.PrivateAddr)
+		// Send multiple acknowledgments with different timing
+		go func() {
+			response := holePunchMessage{
+				Type:        "punch_ack",
+				PeerID:      n.tcpTransport.ListenAddr,
+				PublicAddr:  n.publicAddr.String(),
+				PrivateAddr: n.privateAddr.String(),
+			}
 
-		// Immediately send multiple acknowledgments
+			data, err := json.Marshal(response)
+			if err != nil {
+				log.Printf("Failed to marshal punch response: %v", err)
+				return
+			}
+
+			// Send multiple waves of acknowledgments
+			for i := 0; i < 5; i++ {
+				for j := 0; j < 3; j++ {
+					n.udpConn.WriteToUDP(data, remoteAddr)
+					time.Sleep(20 * time.Millisecond)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}()
+
+	case "punch_ack":
+		pubAddr, err := net.ResolveUDPAddr("udp", msg.PublicAddr)
+		if err != nil {
+			log.Printf("Failed to resolve peer public address: %v", err)
+			return
+		}
+
+		privAddr, err := net.ResolveUDPAddr("udp", msg.PrivateAddr)
+		if err != nil {
+			log.Printf("Failed to resolve peer private address: %v", err)
+			return
+		}
+
+		n.peers[msg.PeerID] = &PeerEndpoint{
+			ID:          msg.PeerID,
+			PublicAddr:  pubAddr,
+			PrivateAddr: privAddr,
+			LastSeen:    time.Now(),
+		}
+
+		// Immediately send acknowledgment back
 		response := holePunchMessage{
 			Type:        "punch_ack",
 			PeerID:      n.tcpTransport.ListenAddr,
@@ -298,37 +368,8 @@ func (n *NATService) handleHolePunchMessage(msg holePunchMessage, remoteAddr *ne
 			PrivateAddr: n.privateAddr.String(),
 		}
 
-		data, err := json.Marshal(response)
-		if err != nil {
-			log.Printf("Failed to marshal punch response: %v", err)
-			return
-		}
-
-		// Send multiple acknowledgments to increase chances of success
-		for i := 0; i < 3; i++ {
-			log.Printf("Sending punch_ack attempt %d/3 to %s", i+1, remoteAddr.String())
+		if data, err := json.Marshal(response); err == nil {
 			n.udpConn.WriteToUDP(data, remoteAddr)
-			time.Sleep(50 * time.Millisecond)
-		}
-
-		// Also send our own punch to help establish bidirectional hole
-		n.sendHolePunch(remoteAddr)
-
-	case "punch_ack":
-		log.Printf("Received punch_ack from peer %s (public: %s, private: %s)",
-			msg.PeerID, msg.PublicAddr, msg.PrivateAddr)
-
-		// Store only the public address
-		pubAddr, err := net.ResolveUDPAddr("udp", msg.PublicAddr)
-		if err != nil {
-			log.Printf("Failed to resolve peer public address: %v", err)
-			return
-		}
-
-		n.peers[msg.PeerID] = &PeerEndpoint{
-			ID:         msg.PeerID,
-			PublicAddr: pubAddr,
-			LastSeen:   time.Now(),
 		}
 
 		log.Printf("Successfully established NAT traversal with peer %s", msg.PeerID)

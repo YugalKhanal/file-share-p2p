@@ -137,9 +137,11 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 func (t *TCPTransport) Dial(addr string) error {
 	if t.NATService != nil {
 		// Attempt NAT traversal
-		if err := t.NATService.InitiateConnection(addr); err != nil {
-			log.Printf("NAT traversal failed for %s: %v", addr, err)
+		err := t.NATService.InitiateConnection(addr)
+		if err == nil {
+			return nil
 		}
+		log.Printf("NAT traversal failed for %s: %v", addr, err)
 	}
 
 	// Get public address
@@ -147,8 +149,8 @@ func (t *TCPTransport) Dial(addr string) error {
 	publicAddr := addrs[0]
 
 	// Multiple connection attempts with increasing delays
-	for attempt := 0; attempt < 5; attempt++ {
-		log.Printf("TCP connection attempt %d/5 to %s", attempt+1, publicAddr)
+	for attempt := 0; attempt < 3; attempt++ {
+		log.Printf("TCP connection attempt %d/3 to %s", attempt+1, publicAddr)
 
 		conn, err := net.DialTimeout("tcp", publicAddr, 5*time.Second)
 		if err == nil {
@@ -157,10 +159,10 @@ func (t *TCPTransport) Dial(addr string) error {
 		}
 
 		log.Printf("Connection attempt failed: %v", err)
-		time.Sleep(time.Duration(attempt+1) * time.Second)
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 	}
 
-	return fmt.Errorf("failed to establish TCP connection after 5 attempts")
+	return fmt.Errorf("failed to establish connection after 3 attempts")
 }
 
 func (t *TCPTransport) ListenAndAccept() error {
