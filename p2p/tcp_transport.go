@@ -134,27 +134,29 @@ func (t *TCPTransport) Dial(addr string) error {
 
 	// Try each address
 	for _, address := range addrs {
-		// Try direct TCP connection first
-		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
-		if err == nil {
-			go t.handleConn(conn, true)
-			return nil
-		}
-		lastErr = err
-
-		// If direct connection fails, try hole punching
+		// Start hole punching first
 		if err := t.punchHole(address); err != nil {
-			log.Printf("Hole punching to %s failed: %v", address, err)
-			continue
+			log.Printf("Hole punching setup failed for %s: %v", address, err)
 		}
 
-		// Try TCP connection again after hole punching
-		conn, err = net.DialTimeout("tcp", address, 5*time.Second)
-		if err == nil {
-			go t.handleConn(conn, true)
-			return nil
+		// Give hole punching some time to work
+		time.Sleep(2 * time.Second)
+
+		// Try multiple connection attempts
+		for attempts := 0; attempts < 3; attempts++ {
+			log.Printf("Attempting TCP connection to %s (attempt %d/3)", address, attempts+1)
+
+			conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+			if err == nil {
+				go t.handleConn(conn, true)
+				return nil
+			}
+			lastErr = err
+
+			if attempts < 2 {
+				time.Sleep(time.Second * time.Duration(attempts+1))
+			}
 		}
-		lastErr = err
 	}
 
 	return fmt.Errorf("failed to connect to any address: %v", lastErr)
