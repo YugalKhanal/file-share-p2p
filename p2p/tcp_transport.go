@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthdm/foreverstore/shared"
 )
 
 // TCPPeer represents the remote node over a TCP established connection.
@@ -155,9 +157,23 @@ func (t *TCPTransport) Dial(addr string) error {
 			500 * time.Millisecond,
 		}
 
+		// Get local address for the punch message
+		localAddr := t.listener.Addr().String()
+		localHost, localPort, err := net.SplitHostPort(localAddr)
+		if err != nil {
+			return fmt.Errorf("failed to parse local address: %v", err)
+		}
+
+		// Use the public IP if available
+		publicIP, err := shared.GetPublicIP()
+		if err == nil {
+			localHost = publicIP
+		}
+
+		fullLocalAddr := net.JoinHostPort(localHost, localPort)
+
 		for _, interval := range intervals {
-			// Fix the message format - remove the colon
-			punchMsg := fmt.Sprintf("PUNCH%s", t.ListenAddr)
+			punchMsg := fmt.Sprintf("PUNCH%s", fullLocalAddr)
 			if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr); err != nil {
 				log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
 				continue
@@ -166,24 +182,17 @@ func (t *TCPTransport) Dial(addr string) error {
 			time.Sleep(interval)
 		}
 
-		// Try TCP connection in parallel
-		go func(targetAddr string) {
-			log.Printf("Attempting TCP connection to %s", targetAddr)
-			if conn, err := net.DialTimeout("tcp", targetAddr, 3*time.Second); err == nil {
-				log.Printf("Successfully established TCP connection to %s", targetAddr)
-				go t.handleConn(conn, true)
-			}
-		}(address)
+		// Wait for connection or timeout for this address
+		select {
+		case <-t.connectedCh:
+			log.Printf("Connection established via hole punching")
+			return nil
+		case <-time.After(5 * time.Second):
+			log.Printf("Hole punching timeout for %s", address)
+		}
 	}
 
-	// Wait for connection or timeout
-	select {
-	case <-t.connectedCh:
-		log.Printf("Connection established via hole punching")
-		return nil
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("connection timeout")
-	}
+	return fmt.Errorf("failed to establish any peer connections")
 }
 
 func (t *TCPTransport) getPort() int {

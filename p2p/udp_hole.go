@@ -6,6 +6,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/anthdm/foreverstore/shared"
 )
 
 func (t *TCPTransport) setupUDPListener() error {
@@ -59,8 +61,24 @@ func (t *TCPTransport) handleUDPMessages() {
 			tcpAddr := message[5:] // Skip "PUNCH" prefix
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
 
-			// Send ACK
-			ackMsg := fmt.Sprintf("ACK%s", t.ListenAddr)
+			// Get local address for the ACK message
+			localAddr := t.listener.Addr().String()
+			localHost, localPort, err := net.SplitHostPort(localAddr)
+			if err != nil {
+				log.Printf("Failed to parse local address: %v", err)
+				continue
+			}
+
+			// Use the public IP if available
+			publicIP, err := shared.GetPublicIP()
+			if err == nil {
+				localHost = publicIP
+			}
+
+			fullLocalAddr := net.JoinHostPort(localHost, localPort)
+
+			// Send ACK with full address
+			ackMsg := fmt.Sprintf("ACK%s", fullLocalAddr)
 			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr)
 			if err != nil {
 				log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
@@ -68,11 +86,13 @@ func (t *TCPTransport) handleUDPMessages() {
 			}
 			log.Printf("Sent ACK to %s", remoteAddr)
 
-			// Try TCP connection
+			// Try TCP connection with the full address
 			go func() {
 				if conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second); err == nil {
 					log.Printf("Successfully established TCP connection to %s", tcpAddr)
 					go t.handleConn(conn, true)
+				} else {
+					log.Printf("Failed to establish TCP connection to %s: %v", tcpAddr, err)
 				}
 			}()
 
