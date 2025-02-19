@@ -72,41 +72,77 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	return server
 }
 
-func isPrivateIP(ip net.IP) bool {
-	privateCIDRs := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-	}
-	for _, cidr := range privateCIDRs {
-		_, subnet, _ := net.ParseCIDR(cidr)
-		if subnet.Contains(ip) {
-			return true
-		}
-	}
-	return ip.IsLoopback()
-}
-
 func filterPeerList(peerList []string) []string {
 	var filtered []string
+
+	log.Printf("Filtering peer list: %v", peerList)
+
 	for _, peer := range peerList {
 		addresses := strings.Split(peer, "|")
 		for _, addr := range addresses {
-			host, _, err := net.SplitHostPort(addr)
+			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
+				log.Printf("Warning: Invalid address format %s: %v", addr, err)
 				continue
 			}
+
 			ip := net.ParseIP(host)
-			if ip != nil && !isPrivateIP(ip) {
-				filtered = append(filtered, addr)
+			if ip == nil {
+				log.Printf("Warning: Could not parse IP from %s", host)
+				continue
+			}
+
+			// Check if this is a valid public IP
+			if ip.IsGlobalUnicast() && !isPrivateIP(ip) {
+				fullAddr := net.JoinHostPort(host, port)
+				filtered = append(filtered, fullAddr)
+				log.Printf("Added public peer address: %s", fullAddr)
+			} else {
+				log.Printf("Skipping non-public IP: %s", host)
 			}
 		}
 	}
+
 	if len(filtered) == 0 {
-		log.Printf("Warning: No public IP peers found, falling back to all peers")
-		return peerList // fallback to all peers
+		log.Printf("Warning: No public IP peers found in %v, falling back to original list", peerList)
+		return peerList
 	}
+
+	log.Printf("Filtered peer list: %v", filtered)
 	return filtered
+}
+
+func isPrivateIP(ip net.IP) bool {
+	privateRanges := []struct {
+		start net.IP
+		end   net.IP
+	}{
+		{
+			net.ParseIP("10.0.0.0"),
+			net.ParseIP("10.255.255.255"),
+		},
+		{
+			net.ParseIP("172.16.0.0"),
+			net.ParseIP("172.31.255.255"),
+		},
+		{
+			net.ParseIP("192.168.0.0"),
+			net.ParseIP("192.168.255.255"),
+		},
+	}
+
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return false
+	}
+
+	for _, r := range privateRanges {
+		if bytes.Compare(ipv4, r.start.To4()) >= 0 && bytes.Compare(ipv4, r.end.To4()) <= 0 {
+			return true
+		}
+	}
+
+	return ip.IsLoopback()
 }
 
 // Determines the peer's full address, combining the detected IP with the listening port
@@ -142,8 +178,16 @@ func getPeerAddress(listenAddr string) (string, error) {
 
 // New function to refresh peer list from tracker
 func (s *FileServer) refreshPeers(fileID string) error {
+	log.Printf("Refreshing peers for file %s", fileID)
+
 	url := fmt.Sprintf("%s/peers?file_id=%s", s.opts.TrackerAddr, fileID)
-	resp, err := http.Get(url)
+
+	// Create client with longer timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to get peers from tracker: %v", err)
 	}
@@ -155,11 +199,12 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	}
 
 	var peerList []string
-	peerList = filterPeerList(peerList)
 	if err := json.NewDecoder(resp.Body).Decode(&peerList); err != nil {
 		return fmt.Errorf("failed to decode peer list: %v", err)
 	}
 
+	// Filter and deduplicate peer list
+	peerList = filterPeerList(peerList)
 	if len(peerList) == 0 {
 		return fmt.Errorf("no peers are currently sharing file %s", fileID)
 	}
@@ -170,28 +215,21 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	var wg sync.WaitGroup
 	successChan := make(chan bool, len(peerList))
 
-	myAddr := s.opts.ListenAddr
-	if strings.HasPrefix(myAddr, ":") {
-		myAddr = "localhost" + myAddr
-	}
-
 	// Try to connect to each peer
 	for _, peerAddr := range peerList {
-		addresses := strings.Split(peerAddr, "|")
-		for _, addr := range addresses {
-			if addr == myAddr {
-				log.Printf("Skipping own address: %s", addr)
-				continue
-			}
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
 
-			wg.Add(1)
-			go func(addr string) {
-				defer wg.Done()
+			// Try multiple times with increasing backoff
+			for attempt := 0; attempt < 3; attempt++ {
+				backoff := time.Duration(attempt) * time.Second
+				time.Sleep(backoff)
 
-				log.Printf("Attempting to connect to peer: %s", addr)
+				log.Printf("Attempting to connect to peer: %s (attempt %d/3)", addr, attempt+1)
 				if err := s.opts.Transport.Dial(addr); err != nil {
 					log.Printf("Failed to connect to peer %s: %v", addr, err)
-					return
+					continue
 				}
 
 				// Wait briefly for the connection to be established
@@ -204,27 +242,25 @@ func (s *FileServer) refreshPeers(fileID string) error {
 				if connected {
 					log.Printf("Successfully connected to peer: %s", addr)
 					successChan <- true
+					return
 				}
-			}(addr)
-		}
+			}
+		}(peerAddr)
 	}
 
-	// Wait for all connection attempts
+	// Wait for all connection attempts with timeout
 	go func() {
 		wg.Wait()
 		close(successChan)
 	}()
 
-	// Wait for at least one successful connection
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-
+	// Wait for at least one successful connection or timeout
 	select {
-	case _, ok := <-successChan:
-		if ok {
+	case success, ok := <-successChan:
+		if ok && success {
 			return nil
 		}
-	case <-timer.C:
+	case <-time.After(15 * time.Second):
 		return fmt.Errorf("timeout waiting for peer connections")
 	}
 

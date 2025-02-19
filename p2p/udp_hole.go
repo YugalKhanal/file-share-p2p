@@ -11,20 +11,34 @@ import (
 func (t *TCPTransport) setupUDPListener() error {
 	log.Printf("Setting up UDP listener on port %d", t.getPort())
 
-	udpAddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
-		Port: t.getPort(),
+	// Try binding to specific addresses
+	ips := []net.IP{net.IPv4zero, net.IPv6zero}
+	var lastErr error
+
+	for _, ip := range ips {
+		udpAddr := &net.UDPAddr{
+			IP:   ip,
+			Port: t.getPort(),
+		}
+
+		conn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Set UDP socket options
+		conn.SetReadBuffer(1024 * 1024)  // 1MB read buffer
+		conn.SetWriteBuffer(1024 * 1024) // 1MB write buffer
+
+		t.udpConn = conn
+		log.Printf("UDP listener established successfully on %s", t.udpConn.LocalAddr())
+
+		go t.handleUDPMessages()
+		return nil
 	}
 
-	var err error
-	t.udpConn, err = net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("UDP listen failed: %v", err)
-	}
-
-	log.Printf("UDP listener established successfully on %s", t.udpConn.LocalAddr())
-	go t.handleUDPMessages()
-	return nil
+	return fmt.Errorf("failed to setup UDP listener: %v", lastErr)
 }
 
 func (t *TCPTransport) handleUDPMessages() {
