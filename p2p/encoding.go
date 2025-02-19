@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
+	"strings"
 )
 
 const ChunkSize = 16 * 1024 * 1024 //16MB chunks
@@ -21,10 +22,14 @@ func (dec GOBDecoder) Decode(r io.Reader, msg *RPC) error {
 
 type DefaultDecoder struct{}
 
+// In encoding.go
 func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
 	// Read message length
 	var lengthBuf [4]byte
 	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
+		if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
+			return err
+		}
 		return fmt.Errorf("failed to read message length: %v", err)
 	}
 	length := binary.BigEndian.Uint32(lengthBuf[:])
@@ -44,6 +49,9 @@ func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
 	msg.Payload = make([]byte, length)
 	_, err := io.ReadFull(r, msg.Payload)
 	if err != nil {
+		if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
+			return err
+		}
 		return fmt.Errorf("failed to read message: %v", err)
 	}
 

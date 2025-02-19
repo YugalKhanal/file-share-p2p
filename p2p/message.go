@@ -46,14 +46,31 @@ type Message struct {
 }
 
 // Register message types for gob encoding
+// func init() {
+// 	// Use RegisterName to avoid package path issues
+// 	gob.RegisterName("Message", Message{})
+// 	gob.RegisterName("MessageChunkRequest", MessageChunkRequest{})
+// 	gob.RegisterName("MessageChunkResponse", MessageChunkResponse{})
+// 	gob.RegisterName("MessageMetadataRequest", MessageMetadataRequest{})
+// 	gob.RegisterName("MessageMetadataResponse", MessageMetadataResponse{})
+// 	gob.RegisterName("Metadata", shared.Metadata{})
+// }
+
 func init() {
 	// Use RegisterName to avoid package path issues
-	gob.RegisterName("Message", Message{})
-	gob.RegisterName("MessageChunkRequest", MessageChunkRequest{})
-	gob.RegisterName("MessageChunkResponse", MessageChunkResponse{})
-	gob.RegisterName("MessageMetadataRequest", MessageMetadataRequest{})
-	gob.RegisterName("MessageMetadataResponse", MessageMetadataResponse{})
-	gob.RegisterName("Metadata", shared.Metadata{})
+	var message Message
+	var chunkReq MessageChunkRequest
+	var chunkResp MessageChunkResponse
+	var metaReq MessageMetadataRequest
+	var metaResp MessageMetadataResponse
+	var metadata shared.Metadata
+
+	gob.Register(message)
+	gob.Register(chunkReq)
+	gob.Register(chunkResp)
+	gob.Register(metaReq)
+	gob.Register(metaResp)
+	gob.Register(metadata)
 }
 
 // Helper functions to ensure consistent message creation

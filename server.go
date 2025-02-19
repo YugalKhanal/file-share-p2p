@@ -467,11 +467,17 @@ func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int
 }
 
 // New method to handle RPC messages
+// In server.go
 func (s *FileServer) handleRPCMessage(rpc p2p.RPC) error {
 	// Decode the basic message structure
 	var msg p2p.Message
 	decoder := gob.NewDecoder(bytes.NewReader(rpc.Payload))
 	if err := decoder.Decode(&msg); err != nil {
+		if strings.Contains(err.Error(), "gob: duplicate type received") {
+			// Log but don't return error for duplicate type registrations
+			log.Printf("Warning: duplicate type registration detected - continuing")
+			return nil
+		}
 		return fmt.Errorf("decode error: %v", err)
 	}
 
@@ -487,7 +493,6 @@ func (s *FileServer) handleRPCMessage(rpc p2p.RPC) error {
 
 	switch msg.Type {
 	case p2p.MessageTypeChunkRequest:
-		// Try both pointer and value type assertions
 		switch req := msg.Payload.(type) {
 		case p2p.MessageChunkRequest:
 			return s.handleChunkRequest(peer, req)
