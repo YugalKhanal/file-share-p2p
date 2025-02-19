@@ -3,13 +3,11 @@ package main
 import (
 	"bytes"
 	"crypto/sha1"
-	"encoding/binary"
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,88 +68,41 @@ func NewStore(opts StoreOpts) *Store {
 }
 
 // handleChunkRequest reads a chunk file from disk and sends it to the requesting peer.
+const UDPChunkSize = 60 * 1024 // 60KB chunks for UDP
+
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
-	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
-
-	// Add flow control - check if we're already sending too many chunks
-	const maxConcurrentChunks = 5
-	s.mu.Lock()
-	activeSends := len(s.responseHandlers)
-	s.mu.Unlock()
-	if activeSends >= maxConcurrentChunks {
-		return fmt.Errorf("too many active chunk transfers")
-	}
-
-	// Validate and get metadata
-	s.activeFilesMu.RLock()
-	activeMeta, isActive := s.activeFiles[req.FileID]
-	s.activeFilesMu.RUnlock()
-
-	var meta *shared.Metadata
-	var err error
-	if isActive {
-		meta = activeMeta
-	} else {
-		meta, err = s.store.GetMetadata(req.FileID)
-		if err != nil {
-			log.Printf("Error getting metadata: %v", err)
-			return fmt.Errorf("file metadata not found: %v", err)
-		}
-	}
-
-	if req.Chunk >= meta.NumChunks {
-		return fmt.Errorf("invalid chunk index %d, file only has %d chunks",
-			req.Chunk, meta.NumChunks)
-	}
-
-	// Read chunk with retry logic
-	var chunkData []byte
-	for retries := 0; retries < 3; retries++ {
-		chunkData, err = s.store.ReadChunk(meta.OriginalPath, req.Chunk)
-		if err == nil {
-			break
-		}
-		log.Printf("Error reading chunk (attempt %d/3): %v", retries+1, err)
-		time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
-	}
+	meta, err := s.store.GetMetadata(req.FileID)
 	if err != nil {
-		return fmt.Errorf("failed to read chunk after retries: %v", err)
+		return err
 	}
 
-	// Send chunk with chunked transfer
-	msg := p2p.NewChunkResponseMessage(req.FileID, req.Chunk, chunkData)
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
-		return fmt.Errorf("failed to encode response: %v", err)
+	chunkData, err := s.store.ReadChunk(meta.OriginalPath, req.Chunk)
+	if err != nil {
+		return err
 	}
 
-	// Split large messages into smaller chunks for transmission
-	const maxChunkSize = 1024 * 1024 // 1MB transmission chunks
-	data := buf.Bytes()
-	totalLen := uint32(len(data))
-
-	// First send the total message length
-	if err := binary.Write(peer, binary.BigEndian, totalLen); err != nil {
-		return fmt.Errorf("failed to write message length: %v", err)
-	}
-
-	// Then send data in chunks
-	for offset := 0; offset < len(data); offset += maxChunkSize {
-		end := offset + maxChunkSize
-		if end > len(data) {
-			end = len(data)
+	// Split into smaller UDP-friendly chunks
+	for i := 0; i < len(chunkData); i += UDPChunkSize {
+		end := i + UDPChunkSize
+		if end > len(chunkData) {
+			end = len(chunkData)
 		}
 
-		n, err := peer.Write(data[offset:end])
-		if err != nil {
-			return fmt.Errorf("failed to write payload: %v", err)
+		msg := p2p.NewChunkResponseMessage(req.FileID, req.Chunk, chunkData[i:end])
+
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
+			return err
 		}
-		if n != end-offset {
-			return fmt.Errorf("incomplete write: wrote %d of %d bytes", n, end-offset)
+
+		if err := peer.Send(buf.Bytes()); err != nil {
+			return err
 		}
+
+		// Small delay between UDP packets
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	log.Printf("Successfully sent chunk %d (%d bytes)", req.Chunk, len(chunkData))
 	return nil
 }
 

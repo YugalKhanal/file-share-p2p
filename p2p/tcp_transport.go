@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/anthdm/foreverstore/shared"
 )
 
 // TCPPeer represents the remote node over a TCP established connection.
@@ -89,6 +87,8 @@ type TCPTransport struct {
 	rpcch       chan RPC
 	punchingMap sync.Map
 	connectedCh chan string
+	peers       map[string]Peer
+	mu          sync.RWMutex
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
@@ -96,6 +96,7 @@ func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
 		TCPTransportOpts: opts,
 		rpcch:            make(chan RPC, 1024),
 		connectedCh:      make(chan string, 1),
+		peers:            make(map[string]Peer),
 	}
 }
 
@@ -123,7 +124,6 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
 	if t.udpConn == nil {
-		log.Printf("Initializing UDP listener for hole punching")
 		if err := t.setupUDPListener(); err != nil {
 			return fmt.Errorf("UDP setup failed: %v", err)
 		}
@@ -132,108 +132,58 @@ func (t *TCPTransport) Dial(addr string) error {
 	addrs := strings.Split(addr, "|")
 	log.Printf("Attempting to connect to addresses: %v", addrs)
 
-	// Create channels for punch success and done
-	punchSuccess := make(chan bool, 1)
-	punchDone := make(chan struct{})
-	defer close(punchDone)
+	// Channel to signal successful UDP hole punch
+	punchSuccess := make(chan *net.UDPAddr, 1)
 
-	// Keep track of received ACKs for verification
-	var ackMutex sync.Mutex
-	ackCount := 0
-
-	// Start listening for ACK responses in background
-	go func() {
-		for {
-			select {
-			case <-punchDone:
-				return
-			default:
-				ackMutex.Lock()
-				if ackCount >= 3 {
-					punchSuccess <- true
-					ackMutex.Unlock()
-					return
-				}
-				ackMutex.Unlock()
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-	}()
-
-	// Handler for received ACKs
-	t.punchingMap.Store("ackHandler", func(remoteAddr *net.UDPAddr) {
-		ackMutex.Lock()
-		ackCount++
-		ackMutex.Unlock()
-	})
-
-	// Try each address
 	for _, address := range addrs {
 		host, portStr, err := net.SplitHostPort(address)
 		if err != nil {
-			log.Printf("Invalid address %s: %v", address, err)
 			continue
 		}
 
 		port, err := strconv.Atoi(portStr)
 		if err != nil {
-			log.Printf("Invalid port in address %s: %v", address, err)
 			continue
 		}
 
-		udpAddr := &net.UDPAddr{
+		targetAddr := &net.UDPAddr{
 			IP:   net.ParseIP(host),
 			Port: port,
 		}
 
-		// Get our public IP
-		publicIP, err := shared.GetPublicIP()
-		if err != nil {
-			log.Printf("Warning: Could not get public IP: %v", err)
-			localIP, err := shared.GetLocalIP()
-			if err != nil {
-				return fmt.Errorf("could not get any IP: %v", err)
-			}
-			publicIP = localIP
-		}
-
-		// Start UDP hole punching process
-		go func(targetAddr *net.UDPAddr) {
-			_, myPort, _ := net.SplitHostPort(t.ListenAddr)
-			ourAddr := net.JoinHostPort(publicIP, myPort)
-
-			// Send PUNCH messages with verification data
+		// Send PUNCH messages
+		go func(addr *net.UDPAddr) {
+			msgID := fmt.Sprintf("%d", time.Now().UnixNano())
 			for i := 0; i < 3; i++ {
-				select {
-				case <-punchDone:
-					return
-				default:
-					msgID := fmt.Sprintf("%d", time.Now().UnixNano())
-					punchMsg := fmt.Sprintf("PUNCH%s|%s", ourAddr, msgID)
-					if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), targetAddr); err != nil {
-						log.Printf("Failed to send punch message to %s: %v", targetAddr, err)
-						continue
-					}
-					log.Printf("Sent punch message %d/3 to %s", i+1, targetAddr)
-					time.Sleep(200 * time.Millisecond)
+				punchMsg := fmt.Sprintf("PUNCH%s|%s", t.ListenAddr, msgID)
+				if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), addr); err != nil {
+					continue
 				}
+				time.Sleep(200 * time.Millisecond)
 			}
-		}(udpAddr)
+		}(targetAddr)
 
-		// Wait for hole punch completion or timeout
+		// Wait for punch success
 		select {
-		case <-punchSuccess:
-			log.Printf("UDP hole punch verified and established with %s", address)
-			t.punchingMap.Delete("ackHandler") // Cleanup handler
+		case addr := <-punchSuccess:
+			peer := &UDPPeer{
+				addr: addr,
+				conn: t.udpConn,
+			}
+
+			// Add peer to our list
+			t.mu.Lock()
+			t.peers[addr.String()] = peer
+			t.mu.Unlock()
+
 			return nil
+
 		case <-time.After(3 * time.Second):
-			log.Printf("UDP hole punch timeout for %s, trying next address", address)
 			continue
 		}
 	}
 
-	t.punchingMap.Delete("ackHandler") // Cleanup handler
-	return fmt.Errorf("failed to establish UDP hole punch with any peer")
+	return fmt.Errorf("failed to establish UDP connection with any peer")
 }
 
 func (t *TCPTransport) getPort() int {
