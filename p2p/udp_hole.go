@@ -55,19 +55,12 @@ func (t *TCPTransport) handleUDPMessages() {
 		message := string(buf[:n])
 		log.Printf("Received UDP message from %s: %s", remoteAddr, message)
 
-		parts := strings.Split(message, ":")
-		if len(parts) != 2 {
-			log.Printf("Invalid message format: %s", message)
-			continue
-		}
-
-		messageType, tcpAddr := parts[0], parts[1]
-		switch messageType {
-		case "PUNCH":
+		if strings.HasPrefix(message, "PUNCH") {
+			tcpAddr := message[5:] // Skip "PUNCH" prefix
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
 
-			// Send immediate acknowledgment
-			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
+			// Send ACK
+			ackMsg := fmt.Sprintf("ACK%s", t.ListenAddr)
 			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr)
 			if err != nil {
 				log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
@@ -75,18 +68,16 @@ func (t *TCPTransport) handleUDPMessages() {
 			}
 			log.Printf("Sent ACK to %s", remoteAddr)
 
-			// Try TCP connection immediately and after a short delay
-			for i := 0; i < 2; i++ {
-				go func(attempt int) {
-					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
-					if conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second); err == nil {
-						log.Printf("Successfully established TCP connection to %s", tcpAddr)
-						go t.handleConn(conn, true)
-					}
-				}(i)
-			}
+			// Try TCP connection
+			go func() {
+				if conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second); err == nil {
+					log.Printf("Successfully established TCP connection to %s", tcpAddr)
+					go t.handleConn(conn, true)
+				}
+			}()
 
-		case "ACK":
+		} else if strings.HasPrefix(message, "ACK") {
+			tcpAddr := message[3:] // Skip "ACK" prefix
 			log.Printf("Received ACK from %s for TCP address %s", remoteAddr, tcpAddr)
 			select {
 			case t.connectedCh <- tcpAddr:
