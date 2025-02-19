@@ -150,45 +150,39 @@ func (t *TCPTransport) Dial(addr string) error {
 			Port: port,
 		}
 
-		// Send punch messages with increasing intervals
-		intervals := []time.Duration{
-			100 * time.Millisecond,
-			200 * time.Millisecond,
-			500 * time.Millisecond,
-		}
-
-		// Get local address for the punch message
-		localAddr := t.listener.Addr().String()
-		localHost, localPort, err := net.SplitHostPort(localAddr)
-		if err != nil {
-			return fmt.Errorf("failed to parse local address: %v", err)
-		}
-
-		// Use the public IP if available
+		// Get our public IP for the PUNCH message
 		publicIP, err := shared.GetPublicIP()
-		if err == nil {
-			localHost = publicIP
+		if err != nil {
+			log.Printf("Warning: Could not get public IP: %v", err)
+			localIP, err := shared.GetLocalIP()
+			if err != nil {
+				return fmt.Errorf("could not get any IP: %v", err)
+			}
+			publicIP = localIP
 		}
 
-		fullLocalAddr := net.JoinHostPort(localHost, localPort)
+		// Send punch messages with our full address
+		_, myPort, _ := net.SplitHostPort(t.ListenAddr)
+		ourAddr := net.JoinHostPort(publicIP, myPort)
 
-		for _, interval := range intervals {
-			punchMsg := fmt.Sprintf("PUNCH%s", fullLocalAddr)
+		for i := 0; i < 3; i++ {
+			punchMsg := fmt.Sprintf("PUNCH%s", ourAddr)
 			if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr); err != nil {
 				log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
 				continue
 			}
 			log.Printf("Sent punch message to %s", udpAddr)
-			time.Sleep(interval)
+			time.Sleep(200 * time.Millisecond)
 		}
 
-		// Wait for connection or timeout for this address
+		// Wait for connection success or timeout
 		select {
 		case <-t.connectedCh:
 			log.Printf("Connection established via hole punching")
 			return nil
 		case <-time.After(5 * time.Second):
-			log.Printf("Hole punching timeout for %s", address)
+			log.Printf("Connection timeout for %s", address)
+			continue
 		}
 	}
 

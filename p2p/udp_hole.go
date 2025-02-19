@@ -6,6 +6,9 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/anthdm/foreverstore/shared"
+	"math/rand"
 )
 
 func (t *TCPTransport) setupUDPListener() error {
@@ -56,11 +59,25 @@ func (t *TCPTransport) handleUDPMessages() {
 		log.Printf("Received UDP message from %s: %s", remoteAddr, message)
 
 		if strings.HasPrefix(message, "PUNCH") {
-			tcpAddr := message[5:] // Skip "PUNCH" prefix
-			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
+			peerAddr := message[5:] // Skip "PUNCH" prefix
+			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, peerAddr)
 
-			// Send ACK
-			ackMsg := fmt.Sprintf("ACK%s", t.ListenAddr)
+			// Get our public IP for the ACK message
+			publicIP, err := shared.GetPublicIP()
+			if err != nil {
+				log.Printf("Warning: Could not get public IP: %v", err)
+				localIP, err := shared.GetLocalIP()
+				if err != nil {
+					log.Printf("Error: Could not get any IP: %v", err)
+					continue
+				}
+				publicIP = localIP
+			}
+
+			// Send ACK with our full address
+			_, port, _ := net.SplitHostPort(t.ListenAddr)
+			ourAddr := net.JoinHostPort(publicIP, port)
+			ackMsg := fmt.Sprintf("ACK%s", ourAddr)
 			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr)
 			if err != nil {
 				log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
@@ -68,79 +85,43 @@ func (t *TCPTransport) handleUDPMessages() {
 			}
 			log.Printf("Sent ACK to %s", remoteAddr)
 
-			// Try both accepting and connecting simultaneously
+			// Try both accepting and connecting in parallel
 			go func() {
-				// Start a goroutine to try accepting
-				acceptChan := make(chan net.Conn, 1)
-				go func() {
-					conn, err := t.listener.Accept()
-					if err == nil {
-						acceptChan <- conn
-					}
-				}()
+				// Wait a small random time before attempting connection
+				time.Sleep(time.Duration(rand.Int63n(500)) * time.Millisecond)
 
-				// Start a goroutine to try connecting
-				dialChan := make(chan net.Conn, 1)
-				go func() {
-					conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second)
-					if err == nil {
-						dialChan <- conn
-					} else {
-						log.Printf("Failed to establish TCP connection to %s: %v", tcpAddr, err)
-					}
-				}()
-
-				// Wait for either connection to succeed
-				select {
-				case conn := <-acceptChan:
-					log.Printf("Accepted TCP connection from %s", tcpAddr)
-					go t.handleConn(conn, false)
-				case conn := <-dialChan:
-					log.Printf("Established outbound TCP connection to %s", tcpAddr)
+				// Try to establish TCP connection
+				conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
+				if err == nil {
+					log.Printf("Successfully established outbound TCP connection to %s", peerAddr)
 					go t.handleConn(conn, true)
-				case <-time.After(5 * time.Second):
-					log.Printf("TCP connection timeout for %s", tcpAddr)
+				} else {
+					log.Printf("Failed to establish TCP connection to %s: %v", peerAddr, err)
 				}
 			}()
 
 		} else if strings.HasPrefix(message, "ACK") {
-			tcpAddr := message[3:] // Skip "ACK" prefix
-			log.Printf("Received ACK from %s for TCP address %s", remoteAddr, tcpAddr)
-			select {
-			case t.connectedCh <- tcpAddr:
-				log.Printf("Notified of successful connection to %s", tcpAddr)
-			default:
-				log.Printf("Failed to notify of connection to %s (channel full)", tcpAddr)
-			}
+			peerAddr := message[3:] // Skip "ACK" prefix
+			log.Printf("Received ACK from %s for TCP address %s", remoteAddr, peerAddr)
 
-			// Try both accepting and connecting simultaneously here too
+			// Try a TCP connection after receiving ACK
 			go func() {
-				// Similar connection attempt code as above
-				acceptChan := make(chan net.Conn, 1)
-				go func() {
-					conn, err := t.listener.Accept()
-					if err == nil {
-						acceptChan <- conn
-					}
-				}()
+				// Wait a small random time before attempting connection
+				time.Sleep(time.Duration(rand.Int63n(500)) * time.Millisecond)
 
-				dialChan := make(chan net.Conn, 1)
-				go func() {
-					conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second)
-					if err == nil {
-						dialChan <- conn
-					}
-				}()
-
-				select {
-				case conn := <-acceptChan:
-					log.Printf("Accepted TCP connection after ACK from %s", tcpAddr)
-					go t.handleConn(conn, false)
-				case conn := <-dialChan:
-					log.Printf("Established outbound TCP connection after ACK to %s", tcpAddr)
+				// Try to establish TCP connection
+				conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
+				if err == nil {
+					log.Printf("Successfully established TCP connection to %s after ACK", peerAddr)
 					go t.handleConn(conn, true)
-				case <-time.After(5 * time.Second):
-					log.Printf("TCP connection timeout after ACK for %s", tcpAddr)
+					select {
+					case t.connectedCh <- peerAddr:
+						log.Printf("Notified of successful connection to %s", peerAddr)
+					default:
+						log.Printf("Failed to notify of connection to %s (channel full)", peerAddr)
+					}
+				} else {
+					log.Printf("Failed to establish TCP connection to %s: %v", peerAddr, err)
 				}
 			}()
 		}
