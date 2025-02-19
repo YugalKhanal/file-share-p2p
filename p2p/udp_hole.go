@@ -6,8 +6,6 @@ import (
 	"net"
 	"strings"
 	"time"
-
-	"github.com/anthdm/foreverstore/shared"
 )
 
 func (t *TCPTransport) setupUDPListener() error {
@@ -61,24 +59,8 @@ func (t *TCPTransport) handleUDPMessages() {
 			tcpAddr := message[5:] // Skip "PUNCH" prefix
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
 
-			// Get local address for the ACK message
-			localAddr := t.listener.Addr().String()
-			localHost, localPort, err := net.SplitHostPort(localAddr)
-			if err != nil {
-				log.Printf("Failed to parse local address: %v", err)
-				continue
-			}
-
-			// Use the public IP if available
-			publicIP, err := shared.GetPublicIP()
-			if err == nil {
-				localHost = publicIP
-			}
-
-			fullLocalAddr := net.JoinHostPort(localHost, localPort)
-
-			// Send ACK with full address
-			ackMsg := fmt.Sprintf("ACK%s", fullLocalAddr)
+			// Send ACK
+			ackMsg := fmt.Sprintf("ACK%s", t.ListenAddr)
 			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr)
 			if err != nil {
 				log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
@@ -86,13 +68,38 @@ func (t *TCPTransport) handleUDPMessages() {
 			}
 			log.Printf("Sent ACK to %s", remoteAddr)
 
-			// Try TCP connection with the full address
+			// Try both accepting and connecting simultaneously
 			go func() {
-				if conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second); err == nil {
-					log.Printf("Successfully established TCP connection to %s", tcpAddr)
+				// Start a goroutine to try accepting
+				acceptChan := make(chan net.Conn, 1)
+				go func() {
+					conn, err := t.listener.Accept()
+					if err == nil {
+						acceptChan <- conn
+					}
+				}()
+
+				// Start a goroutine to try connecting
+				dialChan := make(chan net.Conn, 1)
+				go func() {
+					conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second)
+					if err == nil {
+						dialChan <- conn
+					} else {
+						log.Printf("Failed to establish TCP connection to %s: %v", tcpAddr, err)
+					}
+				}()
+
+				// Wait for either connection to succeed
+				select {
+				case conn := <-acceptChan:
+					log.Printf("Accepted TCP connection from %s", tcpAddr)
+					go t.handleConn(conn, false)
+				case conn := <-dialChan:
+					log.Printf("Established outbound TCP connection to %s", tcpAddr)
 					go t.handleConn(conn, true)
-				} else {
-					log.Printf("Failed to establish TCP connection to %s: %v", tcpAddr, err)
+				case <-time.After(5 * time.Second):
+					log.Printf("TCP connection timeout for %s", tcpAddr)
 				}
 			}()
 
@@ -105,6 +112,37 @@ func (t *TCPTransport) handleUDPMessages() {
 			default:
 				log.Printf("Failed to notify of connection to %s (channel full)", tcpAddr)
 			}
+
+			// Try both accepting and connecting simultaneously here too
+			go func() {
+				// Similar connection attempt code as above
+				acceptChan := make(chan net.Conn, 1)
+				go func() {
+					conn, err := t.listener.Accept()
+					if err == nil {
+						acceptChan <- conn
+					}
+				}()
+
+				dialChan := make(chan net.Conn, 1)
+				go func() {
+					conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second)
+					if err == nil {
+						dialChan <- conn
+					}
+				}()
+
+				select {
+				case conn := <-acceptChan:
+					log.Printf("Accepted TCP connection after ACK from %s", tcpAddr)
+					go t.handleConn(conn, false)
+				case conn := <-dialChan:
+					log.Printf("Established outbound TCP connection after ACK to %s", tcpAddr)
+					go t.handleConn(conn, true)
+				case <-time.After(5 * time.Second):
+					log.Printf("TCP connection timeout after ACK for %s", tcpAddr)
+				}
+			}()
 		}
 	}
 }
