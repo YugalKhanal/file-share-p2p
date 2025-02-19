@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -241,6 +242,51 @@ func NormalizeAddress(addr string) string {
 		}
 	}
 	return addr
+}
+
+func (t *TCPTransport) attemptSimultaneousConnect(peerAddr string) error {
+	log.Printf("Attempting simultaneous TCP connection with %s", peerAddr)
+
+	// Create channels for both accept and dial results
+	acceptCh := make(chan net.Conn, 1)
+	dialCh := make(chan net.Conn, 1)
+	errCh := make(chan error, 2)
+
+	// Start accepting connections
+	go func() {
+		conn, err := t.listener.Accept()
+		if err != nil {
+			errCh <- fmt.Errorf("accept error: %v", err)
+			return
+		}
+		acceptCh <- conn
+	}()
+
+	// Start dialing
+	go func() {
+		// Add a small random delay before dialing
+		time.Sleep(time.Duration(rand.Int63n(100)) * time.Millisecond)
+		conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
+		if err != nil {
+			errCh <- fmt.Errorf("dial error: %v", err)
+			return
+		}
+		dialCh <- conn
+	}()
+
+	// Wait for either connection to succeed or both to fail
+	select {
+	case conn := <-acceptCh:
+		log.Printf("Successfully accepted connection from %s", peerAddr)
+		go t.handleConn(conn, false)
+		return nil
+	case conn := <-dialCh:
+		log.Printf("Successfully dialed connection to %s", peerAddr)
+		go t.handleConn(conn, true)
+		return nil
+	case <-time.After(6 * time.Second):
+		return fmt.Errorf("connection timeout")
+	}
 }
 
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {

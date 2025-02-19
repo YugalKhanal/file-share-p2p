@@ -5,10 +5,8 @@ import (
 	"log"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/anthdm/foreverstore/shared"
-	"math/rand"
 )
 
 func (t *TCPTransport) setupUDPListener() error {
@@ -65,7 +63,6 @@ func (t *TCPTransport) handleUDPMessages() {
 			// Get our public IP for the ACK message
 			publicIP, err := shared.GetPublicIP()
 			if err != nil {
-				log.Printf("Warning: Could not get public IP: %v", err)
 				localIP, err := shared.GetLocalIP()
 				if err != nil {
 					log.Printf("Error: Could not get any IP: %v", err)
@@ -85,18 +82,10 @@ func (t *TCPTransport) handleUDPMessages() {
 			}
 			log.Printf("Sent ACK to %s", remoteAddr)
 
-			// Try both accepting and connecting in parallel
+			// Try simultaneous TCP connection
 			go func() {
-				// Wait a small random time before attempting connection
-				time.Sleep(time.Duration(rand.Int63n(500)) * time.Millisecond)
-
-				// Try to establish TCP connection
-				conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
-				if err == nil {
-					log.Printf("Successfully established outbound TCP connection to %s", peerAddr)
-					go t.handleConn(conn, true)
-				} else {
-					log.Printf("Failed to establish TCP connection to %s: %v", peerAddr, err)
+				if err := t.attemptSimultaneousConnect(peerAddr); err != nil {
+					log.Printf("Simultaneous connection failed: %v", err)
 				}
 			}()
 
@@ -104,24 +93,17 @@ func (t *TCPTransport) handleUDPMessages() {
 			peerAddr := message[3:] // Skip "ACK" prefix
 			log.Printf("Received ACK from %s for TCP address %s", remoteAddr, peerAddr)
 
-			// Try a TCP connection after receiving ACK
+			// Try simultaneous TCP connection
 			go func() {
-				// Wait a small random time before attempting connection
-				time.Sleep(time.Duration(rand.Int63n(500)) * time.Millisecond)
-
-				// Try to establish TCP connection
-				conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
-				if err == nil {
-					log.Printf("Successfully established TCP connection to %s after ACK", peerAddr)
-					go t.handleConn(conn, true)
+				if err := t.attemptSimultaneousConnect(peerAddr); err != nil {
+					log.Printf("Simultaneous connection failed: %v", err)
+				} else {
 					select {
 					case t.connectedCh <- peerAddr:
 						log.Printf("Notified of successful connection to %s", peerAddr)
 					default:
 						log.Printf("Failed to notify of connection to %s (channel full)", peerAddr)
 					}
-				} else {
-					log.Printf("Failed to establish TCP connection to %s: %v", peerAddr, err)
 				}
 			}()
 		}
