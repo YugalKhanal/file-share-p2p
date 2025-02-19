@@ -167,14 +167,14 @@ func (t *TCPTransport) Dial(addr string) error {
 			}
 
 			// Try TCP connection in parallel
-			go func() {
-				log.Printf("Attempting TCP connection to %s", targetAddr)
-				if conn, err := net.DialTimeout("tcp", targetAddr, 3*time.Second); err == nil {
-					log.Printf("Successfully established TCP connection to %s", targetAddr)
-					go t.handleConn(conn, true)
-					close(successChan)
-				}
-			}()
+			// go func() {
+			// 	log.Printf("Attempting TCP connection to %s", targetAddr)
+			// 	if conn, err := net.DialTimeout("tcp", targetAddr, 3*time.Second); err == nil {
+			// 		log.Printf("Successfully established TCP connection to %s", targetAddr)
+			// 		go t.handleConn(conn, true)
+			// 		close(successChan)
+			// 	}
+			// }()
 		}(address)
 	}
 
