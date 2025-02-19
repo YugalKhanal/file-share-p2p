@@ -129,12 +129,12 @@ func (t *TCPTransport) Dial(addr string) error {
 	addrs := strings.Split(addr, "|")
 	log.Printf("Attempting to connect to addresses: %v", addrs)
 
-	// Try each address
-	for _, address := range addrs {
-		// Create channels for coordination
-		successChan := make(chan struct{})
-		errChan := make(chan error)
+	// Create channels for coordination
+	successChan := make(chan struct{})
+	errChan := make(chan error, len(addrs))
 
+	// Try each address in parallel
+	for _, address := range addrs {
 		go func(targetAddr string) {
 			host, portStr, err := net.SplitHostPort(targetAddr)
 			if err != nil {
@@ -148,61 +148,49 @@ func (t *TCPTransport) Dial(addr string) error {
 				return
 			}
 
-			// Try direct TCP connection first
-			log.Printf("Attempting direct TCP connection to %s", targetAddr)
-			if conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second); err == nil {
-				log.Printf("Direct TCP connection successful to %s", targetAddr)
-				go t.handleConn(conn, true)
-				close(successChan)
-				return
-			}
-
-			// If direct connection fails, try UDP hole punching
 			udpAddr := &net.UDPAddr{
 				IP:   net.ParseIP(host),
 				Port: port,
 			}
 
-			// Send punch messages with increasing intervals
-			intervals := []time.Duration{
-				100 * time.Millisecond,
-				200 * time.Millisecond,
-				500 * time.Millisecond,
-			}
+			// Send punch message
+			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
 
-			for _, interval := range intervals {
-				punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
+			// Send multiple punch messages with shorter intervals
+			for i := 0; i < 3; i++ {
 				if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr); err != nil {
 					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
 					continue
 				}
 				log.Printf("Sent punch message to %s", udpAddr)
-				time.Sleep(interval)
+				time.Sleep(100 * time.Millisecond)
 			}
 
-			// Wait for connection establishment
-			select {
-			case <-t.connectedCh:
-				close(successChan)
-			case <-time.After(5 * time.Second):
-				errChan <- fmt.Errorf("hole punching timeout")
-			}
+			// Try TCP connection in parallel
+			go func() {
+				log.Printf("Attempting TCP connection to %s", targetAddr)
+				if conn, err := net.DialTimeout("tcp", targetAddr, 3*time.Second); err == nil {
+					log.Printf("Successfully established TCP connection to %s", targetAddr)
+					go t.handleConn(conn, true)
+					close(successChan)
+				}
+			}()
 		}(address)
-
-		// Wait for success or timeout for this address
-		select {
-		case <-successChan:
-			return nil
-		case err := <-errChan:
-			log.Printf("Connection attempt failed: %v", err)
-			continue
-		case <-time.After(10 * time.Second):
-			log.Printf("Connection attempt timed out")
-			continue
-		}
 	}
 
-	return fmt.Errorf("failed to connect to any address")
+	// Wait for success or timeout
+	select {
+	case <-successChan:
+		log.Printf("Connection established")
+		return nil
+	case <-t.connectedCh:
+		log.Printf("Connection established via hole punching")
+		return nil
+	case err := <-errChan:
+		return fmt.Errorf("connection error: %v", err)
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("connection timeout")
+	}
 }
 
 func (t *TCPTransport) getPort() int {

@@ -52,26 +52,24 @@ func (t *TCPTransport) handleUDPMessages() {
 		case "PUNCH":
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
 
-			// Try multiple connection attempts
-			for i := 0; i < 3; i++ {
-				// Send ACK
-				ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
-				if _, err := t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr); err != nil {
-					log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
-				} else {
-					log.Printf("Sent ACK to %s (attempt %d)", remoteAddr, i+1)
-				}
+			// Send immediate acknowledgment
+			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
+			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr)
+			if err != nil {
+				log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
+				continue
+			}
+			log.Printf("Sent ACK to %s", remoteAddr)
 
-				// Try TCP connection
+			// Try TCP connection immediately and after a short delay
+			for i := 0; i < 2; i++ {
 				go func(attempt int) {
-					time.Sleep(time.Duration(attempt*100) * time.Millisecond)
+					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 					if conn, err := net.DialTimeout("tcp", tcpAddr, 3*time.Second); err == nil {
 						log.Printf("Successfully established TCP connection to %s", tcpAddr)
 						go t.handleConn(conn, true)
 					}
 				}(i)
-
-				time.Sleep(200 * time.Millisecond)
 			}
 
 		case "ACK":
