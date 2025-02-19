@@ -45,7 +45,7 @@ func (t *TCPTransport) setupUDPListener() error {
 
 func (t *TCPTransport) handleUDPMessages() {
 	log.Printf("Starting UDP message handler")
-	buf := make([]byte, 2048) // Increased buffer size
+	buf := make([]byte, 2048)
 
 	for {
 		n, remoteAddr, err := t.udpConn.ReadFromUDP(buf)
@@ -59,64 +59,51 @@ func (t *TCPTransport) handleUDPMessages() {
 		message := string(buf[:n])
 		log.Printf("Received UDP message from %s: %s", remoteAddr, message)
 
-		// Handle message in a separate goroutine
-		go func(msg string, addr *net.UDPAddr) {
-			if strings.HasPrefix(msg, "PUNCH") {
-				peerAddr := msg[5:] // Skip "PUNCH" prefix
-				log.Printf("Received PUNCH from %s for TCP address %s", addr, peerAddr)
+		if strings.HasPrefix(message, "PUNCH") {
+			peerAddr := message[5:] // Skip "PUNCH" prefix
+			log.Printf("Received PUNCH from %s for address %s", remoteAddr, peerAddr)
 
-				// Get our public IP for the ACK message
-				publicIP, err := shared.GetPublicIP()
+			// Get our public IP for the ACK message
+			publicIP, err := shared.GetPublicIP()
+			if err != nil {
+				localIP, err := shared.GetLocalIP()
 				if err != nil {
-					log.Printf("Failed to get public IP: %v", err)
-					localIP, err := shared.GetLocalIP()
-					if err != nil {
-						log.Printf("Error: Could not get any IP: %v", err)
-						return
-					}
-					publicIP = localIP
+					log.Printf("Error: Could not get any IP: %v", err)
+					continue
+				}
+				publicIP = localIP
+			}
+
+			// Send multiple ACK messages with our full address
+			_, port, _ := net.SplitHostPort(t.ListenAddr)
+			ourAddr := net.JoinHostPort(publicIP, port)
+
+			go func() {
+				// Send multiple ACKs with different intervals
+				intervals := []time.Duration{
+					50 * time.Millisecond,
+					100 * time.Millisecond,
+					200 * time.Millisecond,
 				}
 
-				// Send multiple ACK messages to improve reliability
-				_, port, _ := net.SplitHostPort(t.ListenAddr)
-				ourAddr := net.JoinHostPort(publicIP, port)
-				ackMsg := fmt.Sprintf("ACK%s", ourAddr)
-
-				for i := 0; i < 3; i++ {
-					_, err = t.udpConn.WriteToUDP([]byte(ackMsg), addr)
-					if err != nil {
-						log.Printf("Failed to send ACK to %s: %v", addr, err)
+				for i, interval := range intervals {
+					ackMsg := fmt.Sprintf("ACK%s", ourAddr)
+					if _, err := t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr); err != nil {
+						log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
 						continue
 					}
-					log.Printf("Sent ACK attempt %d/3 to %s", i+1, addr)
-					time.Sleep(100 * time.Millisecond)
+					log.Printf("Sent ACK %d/3 to %s", i+1, remoteAddr)
+					time.Sleep(interval)
 				}
+			}()
 
-				// Try simultaneous TCP connection
-				go func() {
-					if err := t.attemptSimultaneousConnect(peerAddr); err != nil {
-						log.Printf("Simultaneous connection failed: %v", err)
-					}
-				}()
-
-			} else if strings.HasPrefix(msg, "ACK") {
-				peerAddr := msg[3:] // Skip "ACK" prefix
-				log.Printf("Received ACK from %s for TCP address %s", addr, peerAddr)
-
-				// Try simultaneous TCP connection
-				go func() {
-					if err := t.attemptSimultaneousConnect(peerAddr); err != nil {
-						log.Printf("Simultaneous connection failed: %v", err)
-					} else {
-						select {
-						case t.connectedCh <- peerAddr:
-							log.Printf("Notified of successful connection to %s", peerAddr)
-						default:
-							log.Printf("Failed to notify of connection to %s (channel full)", peerAddr)
-						}
-					}
-				}()
+			// Notify of successful hole punch
+			select {
+			case t.connectedCh <- peerAddr:
+				log.Printf("UDP hole punch established with %s", peerAddr)
+			default:
+				log.Printf("Channel full, but UDP hole punch established with %s", peerAddr)
 			}
-		}(message, remoteAddr)
+		}
 	}
 }

@@ -132,6 +132,11 @@ func (t *TCPTransport) Dial(addr string) error {
 	addrs := strings.Split(addr, "|")
 	log.Printf("Attempting to connect to addresses: %v", addrs)
 
+	// Create a channel to track successful hole punching
+	punchSuccess := make(chan bool, 1)
+	punchDone := make(chan struct{})
+	defer close(punchDone)
+
 	// Try each address
 	for _, address := range addrs {
 		host, portStr, err := net.SplitHostPort(address)
@@ -162,32 +167,47 @@ func (t *TCPTransport) Dial(addr string) error {
 			publicIP = localIP
 		}
 
-		// Send punch messages with our full address
-		_, myPort, _ := net.SplitHostPort(t.ListenAddr)
-		ourAddr := net.JoinHostPort(publicIP, myPort)
+		// Start UDP hole punching process
+		go func(targetAddr *net.UDPAddr) {
+			// Send punch messages with our full address
+			_, myPort, _ := net.SplitHostPort(t.ListenAddr)
+			ourAddr := net.JoinHostPort(publicIP, myPort)
 
-		for i := 0; i < 3; i++ {
-			punchMsg := fmt.Sprintf("PUNCH%s", ourAddr)
-			if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr); err != nil {
-				log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
-				continue
+			// Send multiple punch messages with increasing intervals
+			intervals := []time.Duration{
+				100 * time.Millisecond,
+				200 * time.Millisecond,
+				400 * time.Millisecond,
 			}
-			log.Printf("Sent punch message to %s", udpAddr)
-			time.Sleep(200 * time.Millisecond)
-		}
 
-		// Wait for connection success or timeout
+			for i, interval := range intervals {
+				select {
+				case <-punchDone:
+					return
+				default:
+					punchMsg := fmt.Sprintf("PUNCH%s", ourAddr)
+					if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), targetAddr); err != nil {
+						log.Printf("Failed to send punch message to %s: %v", targetAddr, err)
+						continue
+					}
+					log.Printf("Sent punch message %d/3 to %s", i+1, targetAddr)
+					time.Sleep(interval)
+				}
+			}
+		}(udpAddr)
+
+		// Wait for successful hole punch or timeout
 		select {
-		case <-t.connectedCh:
-			log.Printf("Connection established via hole punching")
+		case <-punchSuccess:
+			log.Printf("UDP hole punch successful")
 			return nil
-		case <-time.After(5 * time.Second):
-			log.Printf("Connection timeout for %s", address)
+		case <-time.After(3 * time.Second):
+			log.Printf("UDP hole punch timeout for %s, trying next address", address)
 			continue
 		}
 	}
 
-	return fmt.Errorf("failed to establish any peer connections")
+	return fmt.Errorf("failed to establish UDP hole punch with any peer")
 }
 
 func (t *TCPTransport) getPort() int {
