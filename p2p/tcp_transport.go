@@ -251,41 +251,104 @@ func (t *TCPTransport) attemptSimultaneousConnect(peerAddr string) error {
 	acceptCh := make(chan net.Conn, 1)
 	dialCh := make(chan net.Conn, 1)
 	errCh := make(chan error, 2)
+	done := make(chan struct{})
+	defer close(done)
 
 	// Start accepting connections
 	go func() {
-		conn, err := t.listener.Accept()
-		if err != nil {
-			errCh <- fmt.Errorf("accept error: %v", err)
-			return
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				conn, err := t.listener.Accept()
+				if err != nil {
+					if !strings.Contains(err.Error(), "use of closed network connection") {
+						select {
+						case errCh <- fmt.Errorf("accept error: %v", err):
+						case <-done:
+						}
+					}
+					return
+				}
+
+				// Verify if this connection is from our target peer
+				remoteAddr := conn.RemoteAddr().String()
+				host, _, _ := net.SplitHostPort(remoteAddr)
+				peerHost, _, _ := net.SplitHostPort(peerAddr)
+
+				if host == peerHost {
+					select {
+					case acceptCh <- conn:
+					case <-done:
+						conn.Close()
+					}
+					return
+				}
+				conn.Close()
+			}
 		}
-		acceptCh <- conn
 	}()
 
-	// Start dialing
-	go func() {
-		// Add a small random delay before dialing
-		time.Sleep(time.Duration(rand.Int63n(100)) * time.Millisecond)
-		conn, err := net.DialTimeout("tcp", peerAddr, 5*time.Second)
-		if err != nil {
-			errCh <- fmt.Errorf("dial error: %v", err)
-			return
-		}
-		dialCh <- conn
-	}()
+	// Start multiple parallel dial attempts
+	for i := 0; i < 3; i++ {
+		go func(attempt int) {
+			// Add jitter to prevent exact simultaneous attempts
+			jitter := time.Duration(rand.Int63n(100)) * time.Millisecond
+			time.Sleep(jitter)
+
+			dialer := &net.Dialer{
+				Timeout: 2 * time.Second, // Shorter timeout per attempt
+			}
+
+			conn, err := dialer.Dial("tcp", peerAddr)
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("dial error (attempt %d): %v", attempt, err):
+				case <-done:
+				}
+				return
+			}
+
+			select {
+			case dialCh <- conn:
+			case <-done:
+				conn.Close()
+			}
+		}(i)
+	}
+
+	// Set a total timeout for the entire connection process
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+
+	// Track number of failed attempts
+	dialErrors := 0
+	const maxDialErrors = 3
 
 	// Wait for either connection to succeed or both to fail
-	select {
-	case conn := <-acceptCh:
-		log.Printf("Successfully accepted connection from %s", peerAddr)
-		go t.handleConn(conn, false)
-		return nil
-	case conn := <-dialCh:
-		log.Printf("Successfully dialed connection to %s", peerAddr)
-		go t.handleConn(conn, true)
-		return nil
-	case <-time.After(6 * time.Second):
-		return fmt.Errorf("connection timeout")
+	for {
+		select {
+		case conn := <-acceptCh:
+			log.Printf("Successfully accepted connection from %s", peerAddr)
+			go t.handleConn(conn, false)
+			return nil
+
+		case conn := <-dialCh:
+			log.Printf("Successfully dialed connection to %s", peerAddr)
+			go t.handleConn(conn, true)
+			return nil
+
+		case err := <-errCh:
+			dialErrors++
+			log.Printf("Connection attempt failed (%d/%d): %v", dialErrors, maxDialErrors, err)
+			if dialErrors >= maxDialErrors {
+				return fmt.Errorf("all connection attempts failed: %v", err)
+			}
+
+		case <-timer.C:
+			return fmt.Errorf("connection timeout after 10 seconds")
+		}
 	}
 }
 
