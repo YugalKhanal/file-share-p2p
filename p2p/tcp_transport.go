@@ -132,8 +132,10 @@ func (t *TCPTransport) Dial(addr string) error {
 	addrs := strings.Split(addr, "|")
 	log.Printf("Attempting to connect to addresses: %v", addrs)
 
-	// Channel to signal successful UDP hole punch
+	// Create punch success channel
 	punchSuccess := make(chan *net.UDPAddr, 1)
+	t.punchingMap.Store("punchSuccess", punchSuccess)
+	defer t.punchingMap.Delete("punchSuccess")
 
 	for _, address := range addrs {
 		host, portStr, err := net.SplitHostPort(address)
@@ -157,28 +159,35 @@ func (t *TCPTransport) Dial(addr string) error {
 			for i := 0; i < 3; i++ {
 				punchMsg := fmt.Sprintf("PUNCH%s|%s", t.ListenAddr, msgID)
 				if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), addr); err != nil {
+					log.Printf("Failed to send punch message: %v", err)
 					continue
 				}
+				log.Printf("Sent punch message %d/3 to %s", i+1, addr)
 				time.Sleep(200 * time.Millisecond)
 			}
 		}(targetAddr)
 
 		// Wait for punch success
 		select {
-		case addr := <-punchSuccess:
-			peer := &UDPPeer{
-				addr: addr,
-				conn: t.udpConn,
-			}
+		case remoteAddr := <-punchSuccess:
+			log.Printf("UDP hole punch successful with %s", remoteAddr)
+			peer := NewUDPPeer(t.udpConn, remoteAddr)
+			peer.wg.Add(1)
 
-			// Add peer to our list
 			t.mu.Lock()
-			t.peers[addr.String()] = peer
+			t.peers[remoteAddr.String()] = peer
 			t.mu.Unlock()
+
+			if t.OnPeer != nil {
+				if err := t.OnPeer(peer); err != nil {
+					return fmt.Errorf("OnPeer failed: %v", err)
+				}
+			}
 
 			return nil
 
 		case <-time.After(3 * time.Second):
+			log.Printf("UDP hole punch timeout for %s, trying next address", address)
 			continue
 		}
 	}

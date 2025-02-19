@@ -180,7 +180,27 @@ func (t *TCPTransport) handleUDPMessages() {
 				log.Printf("Channel full, but UDP hole punch established with %s", peerListenAddr)
 			}
 
-		} else if !strings.HasPrefix(message, "ACK") {
+		} else if strings.HasPrefix(message, "ACK") {
+			parts := strings.Split(message[3:], "|")
+			if len(parts) != 2 {
+				log.Printf("Invalid ACK format: %s", message)
+				continue
+			}
+
+			log.Printf("Received ACK from %s", remoteAddr)
+
+			// Notify of successful punch
+			if handler, ok := t.punchingMap.Load("punchSuccess"); ok {
+				if ch, ok := handler.(chan *net.UDPAddr); ok {
+					select {
+					case ch <- remoteAddr:
+						log.Printf("Notified punch success for %s", remoteAddr)
+					default:
+						log.Printf("Punch success channel full for %s", remoteAddr)
+					}
+				}
+			}
+		} else {
 			rpc := RPC{
 				From:    remoteAddr.String(),
 				Payload: buf[:n],
