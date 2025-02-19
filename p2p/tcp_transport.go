@@ -132,10 +132,40 @@ func (t *TCPTransport) Dial(addr string) error {
 	addrs := strings.Split(addr, "|")
 	log.Printf("Attempting to connect to addresses: %v", addrs)
 
-	// Create a channel to track successful hole punching
+	// Create channels for punch success and done
 	punchSuccess := make(chan bool, 1)
 	punchDone := make(chan struct{})
 	defer close(punchDone)
+
+	// Keep track of received ACKs for verification
+	var ackMutex sync.Mutex
+	ackCount := 0
+
+	// Start listening for ACK responses in background
+	go func() {
+		for {
+			select {
+			case <-punchDone:
+				return
+			default:
+				ackMutex.Lock()
+				if ackCount >= 3 {
+					punchSuccess <- true
+					ackMutex.Unlock()
+					return
+				}
+				ackMutex.Unlock()
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Handler for received ACKs
+	t.punchingMap.Store("ackHandler", func(remoteAddr *net.UDPAddr) {
+		ackMutex.Lock()
+		ackCount++
+		ackMutex.Unlock()
+	})
 
 	// Try each address
 	for _, address := range addrs {
@@ -156,7 +186,7 @@ func (t *TCPTransport) Dial(addr string) error {
 			Port: port,
 		}
 
-		// Get our public IP for the PUNCH message
+		// Get our public IP
 		publicIP, err := shared.GetPublicIP()
 		if err != nil {
 			log.Printf("Warning: Could not get public IP: %v", err)
@@ -169,37 +199,32 @@ func (t *TCPTransport) Dial(addr string) error {
 
 		// Start UDP hole punching process
 		go func(targetAddr *net.UDPAddr) {
-			// Send punch messages with our full address
 			_, myPort, _ := net.SplitHostPort(t.ListenAddr)
 			ourAddr := net.JoinHostPort(publicIP, myPort)
 
-			// Send multiple punch messages with increasing intervals
-			intervals := []time.Duration{
-				100 * time.Millisecond,
-				200 * time.Millisecond,
-				400 * time.Millisecond,
-			}
-
-			for i, interval := range intervals {
+			// Send PUNCH messages with verification data
+			for i := 0; i < 3; i++ {
 				select {
 				case <-punchDone:
 					return
 				default:
-					punchMsg := fmt.Sprintf("PUNCH%s", ourAddr)
+					msgID := fmt.Sprintf("%d", time.Now().UnixNano())
+					punchMsg := fmt.Sprintf("PUNCH%s|%s", ourAddr, msgID)
 					if _, err := t.udpConn.WriteToUDP([]byte(punchMsg), targetAddr); err != nil {
 						log.Printf("Failed to send punch message to %s: %v", targetAddr, err)
 						continue
 					}
 					log.Printf("Sent punch message %d/3 to %s", i+1, targetAddr)
-					time.Sleep(interval)
+					time.Sleep(200 * time.Millisecond)
 				}
 			}
 		}(udpAddr)
 
-		// Wait for successful hole punch or timeout
+		// Wait for hole punch completion or timeout
 		select {
 		case <-punchSuccess:
-			log.Printf("UDP hole punch successful")
+			log.Printf("UDP hole punch verified and established with %s", address)
+			t.punchingMap.Delete("ackHandler") // Cleanup handler
 			return nil
 		case <-time.After(3 * time.Second):
 			log.Printf("UDP hole punch timeout for %s, trying next address", address)
@@ -207,6 +232,7 @@ func (t *TCPTransport) Dial(addr string) error {
 		}
 	}
 
+	t.punchingMap.Delete("ackHandler") // Cleanup handler
 	return fmt.Errorf("failed to establish UDP hole punch with any peer")
 }
 

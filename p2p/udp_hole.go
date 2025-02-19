@@ -60,8 +60,16 @@ func (t *TCPTransport) handleUDPMessages() {
 		log.Printf("Received UDP message from %s: %s", remoteAddr, message)
 
 		if strings.HasPrefix(message, "PUNCH") {
-			peerAddr := message[5:] // Skip "PUNCH" prefix
-			log.Printf("Received PUNCH from %s for address %s", remoteAddr, peerAddr)
+			parts := strings.Split(message[5:], "|") // Skip "PUNCH" prefix
+			if len(parts) != 2 {
+				log.Printf("Invalid PUNCH message format from %s", remoteAddr)
+				continue
+			}
+
+			peerAddr := parts[0]
+			msgID := parts[1]
+
+			log.Printf("Received PUNCH from %s for address %s (ID: %s)", remoteAddr, peerAddr, msgID)
 
 			// Get our public IP for the ACK message
 			publicIP, err := shared.GetPublicIP()
@@ -74,26 +82,19 @@ func (t *TCPTransport) handleUDPMessages() {
 				publicIP = localIP
 			}
 
-			// Send multiple ACK messages with our full address
+			// Send ACK messages
 			_, port, _ := net.SplitHostPort(t.ListenAddr)
 			ourAddr := net.JoinHostPort(publicIP, port)
 
 			go func() {
-				// Send multiple ACKs with different intervals
-				intervals := []time.Duration{
-					50 * time.Millisecond,
-					100 * time.Millisecond,
-					200 * time.Millisecond,
-				}
-
-				for i, interval := range intervals {
-					ackMsg := fmt.Sprintf("ACK%s", ourAddr)
+				for i := 0; i < 3; i++ {
+					ackMsg := fmt.Sprintf("ACK%s|%s", ourAddr, msgID)
 					if _, err := t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr); err != nil {
 						log.Printf("Failed to send ACK to %s: %v", remoteAddr, err)
 						continue
 					}
 					log.Printf("Sent ACK %d/3 to %s", i+1, remoteAddr)
-					time.Sleep(interval)
+					time.Sleep(100 * time.Millisecond)
 				}
 			}()
 
@@ -103,6 +104,19 @@ func (t *TCPTransport) handleUDPMessages() {
 				log.Printf("UDP hole punch established with %s", peerAddr)
 			default:
 				log.Printf("Channel full, but UDP hole punch established with %s", peerAddr)
+			}
+		} else if strings.HasPrefix(message, "ACK") {
+			parts := strings.Split(message[3:], "|") // Skip "ACK" prefix
+			if len(parts) != 2 {
+				log.Printf("Invalid ACK message format from %s", remoteAddr)
+				continue
+			}
+
+			// Call ACK handler if registered
+			if handler, ok := t.punchingMap.Load("ackHandler"); ok {
+				if fn, ok := handler.(func(*net.UDPAddr)); ok {
+					fn(remoteAddr)
+				}
 			}
 		}
 	}
