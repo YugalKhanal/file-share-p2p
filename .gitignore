@@ -1,5 +1,5 @@
 .idea
-*.txt
+largefile*
 bin
 shared_files
 downloaded_*
