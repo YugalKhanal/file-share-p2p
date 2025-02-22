@@ -74,41 +74,26 @@ func NewStore(opts StoreOpts) *Store {
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
 	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
 
-	// Add flow control - check if we're already sending too many chunks
-	const maxConcurrentChunks = 5
-	s.mu.Lock()
-	activeSends := len(s.responseHandlers)
-	s.mu.Unlock()
-	if activeSends >= maxConcurrentChunks {
-		return fmt.Errorf("too many active chunk transfers")
-	}
-
-	// Validate and get metadata
+	// First check if we're actively sharing this file
 	s.activeFilesMu.RLock()
 	activeMeta, isActive := s.activeFiles[req.FileID]
 	s.activeFilesMu.RUnlock()
 
-	var meta *shared.Metadata
-	var err error
-	if isActive {
-		meta = activeMeta
-	} else {
-		meta, err = s.store.GetMetadata(req.FileID)
-		if err != nil {
-			log.Printf("Error getting metadata: %v", err)
-			return fmt.Errorf("file metadata not found: %v", err)
-		}
+	if !isActive {
+		return fmt.Errorf("file %s is not actively shared by this peer", req.FileID)
 	}
 
-	if req.Chunk >= meta.NumChunks {
+	// Validate chunk index
+	if req.Chunk >= activeMeta.NumChunks {
 		return fmt.Errorf("invalid chunk index %d, file only has %d chunks",
-			req.Chunk, meta.NumChunks)
+			req.Chunk, activeMeta.NumChunks)
 	}
 
 	// Read chunk with retry logic
 	var chunkData []byte
+	var err error
 	for retries := 0; retries < 3; retries++ {
-		chunkData, err = s.store.ReadChunk(meta.OriginalPath, req.Chunk)
+		chunkData, err = s.store.ReadChunk(activeMeta.OriginalPath, req.Chunk)
 		if err == nil {
 			break
 		}
@@ -119,40 +104,17 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return fmt.Errorf("failed to read chunk after retries: %v", err)
 	}
 
-	// Send chunk with chunked transfer
+	// Send chunk response
 	msg := p2p.NewChunkResponseMessage(req.FileID, req.Chunk, chunkData)
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
 		return fmt.Errorf("failed to encode response: %v", err)
 	}
 
-	// Split large messages into smaller chunks for transmission
-	const maxChunkSize = 1024 * 1024 // 1MB transmission chunks
-	data := buf.Bytes()
-	totalLen := uint32(len(data))
-
-	// First send the total message length
-	if err := binary.Write(peer, binary.BigEndian, totalLen); err != nil {
-		return fmt.Errorf("failed to write message length: %v", err)
+	if err := peer.Send(buf.Bytes()); err != nil {
+		return fmt.Errorf("failed to send chunk: %v", err)
 	}
 
-	// Then send data in chunks
-	for offset := 0; offset < len(data); offset += maxChunkSize {
-		end := offset + maxChunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-
-		n, err := peer.Write(data[offset:end])
-		if err != nil {
-			return fmt.Errorf("failed to write payload: %v", err)
-		}
-		if n != end-offset {
-			return fmt.Errorf("incomplete write: wrote %d of %d bytes", n, end-offset)
-		}
-	}
-
-	log.Printf("Successfully sent chunk %d (%d bytes)", req.Chunk, len(chunkData))
 	return nil
 }
 

@@ -156,26 +156,24 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	}
 
 	if len(peerList) == 0 {
-		return fmt.Errorf("no peers are currently sharing file %s", fileID)
+		return fmt.Errorf("no active peers are currently sharing file %s", fileID)
 	}
 
 	log.Printf("Received peer list from tracker: %v", peerList)
+
+	// Reset existing peer connections
+	s.mu.Lock()
+	s.peers = make(map[string]p2p.Peer)
+	s.mu.Unlock()
 
 	// Create a wait group to track connection attempts
 	var wg sync.WaitGroup
 	successChan := make(chan bool, len(peerList))
 
-	myAddr := s.opts.ListenAddr
-	if strings.HasPrefix(myAddr, ":") {
-		myAddr = "localhost" + myAddr
-	}
-
-	// Try to connect to each peer
 	for _, peerAddr := range peerList {
 		addresses := strings.Split(peerAddr, "|")
 		for _, addr := range addresses {
-			if addr == myAddr {
-				log.Printf("Skipping own address: %s", addr)
+			if addr == s.opts.ListenAddr {
 				continue
 			}
 
@@ -183,7 +181,6 @@ func (s *FileServer) refreshPeers(fileID string) error {
 			go func(addr string) {
 				defer wg.Done()
 
-				log.Printf("Attempting to connect to peer: %s", addr)
 				if err := s.opts.Transport.Dial(addr); err != nil {
 					log.Printf("Failed to connect to peer %s: %v", addr, err)
 					return
@@ -197,21 +194,20 @@ func (s *FileServer) refreshPeers(fileID string) error {
 				s.mu.RUnlock()
 
 				if connected {
-					log.Printf("Successfully connected to peer: %s", addr)
 					successChan <- true
 				}
 			}(addr)
 		}
 	}
 
-	// Wait for all connection attempts
+	// Wait for all connection attempts with timeout
 	go func() {
 		wg.Wait()
 		close(successChan)
 	}()
 
-	// Wait for at least one successful connection
-	timer := time.NewTimer(5 * time.Second)
+	// Wait for at least one successful connection or timeout
+	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
 
 	select {
@@ -219,11 +215,10 @@ func (s *FileServer) refreshPeers(fileID string) error {
 		if ok {
 			return nil
 		}
+		return fmt.Errorf("failed to connect to any peers")
 	case <-timer.C:
 		return fmt.Errorf("timeout waiting for peer connections")
 	}
-
-	return fmt.Errorf("failed to establish any peer connections")
 }
 
 func (s *FileServer) Start() error {

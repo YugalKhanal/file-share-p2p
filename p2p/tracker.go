@@ -327,27 +327,38 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *Tracker) cleanupStalePeers() {
-	threshold := time.Now().Add(-2 * time.Minute) // Consider peers stale after 2 minute
+	threshold := time.Now().Add(-2 * time.Minute) // Consider peers stale after 2 minutes
 
+	// Track files that need to be removed
+	filesToRemove := make(map[string]bool)
+
+	// First pass: identify stale peers and remove them
 	for peerAddr, lastSeen := range t.peerLastSeen {
 		if lastSeen.Before(threshold) {
 			// Remove stale peer from all files
 			for fileID, peers := range t.peerIndex {
 				if peers[peerAddr] {
 					delete(peers, peerAddr)
+
 					// Update file info
 					if info, exists := t.fileIndex[fileID]; exists {
 						info.NumPeers = len(peers)
-						// Remove file if no peers are sharing it
+						// Mark file for removal if no peers are sharing it
 						if info.NumPeers == 0 {
-							delete(t.fileIndex, fileID)
-							delete(t.peerIndex, fileID)
+							filesToRemove[fileID] = true
 						}
 					}
 				}
 			}
 			delete(t.peerLastSeen, peerAddr)
 		}
+	}
+
+	// Second pass: remove files with no peers
+	for fileID := range filesToRemove {
+		delete(t.fileIndex, fileID)
+		delete(t.peerIndex, fileID)
+		log.Printf("Removed file %s from tracker as it has no active peers", fileID)
 	}
 }
 
