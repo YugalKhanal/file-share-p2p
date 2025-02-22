@@ -151,20 +151,10 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 }
 
 func (s *Store) ReadChunk(filePath string, chunkIndex int) ([]byte, error) {
-	// Validate file path is within store directory
-	absPath, err := filepath.Abs(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("invalid file path: %v", err)
-	}
-	storeRoot, err := filepath.Abs(s.opts.Root)
-	if err != nil {
-		return nil, fmt.Errorf("invalid store root: %v", err)
-	}
-	if !strings.HasPrefix(absPath, storeRoot) {
-		return nil, fmt.Errorf("attempt to access file outside store directory")
-	}
+	// Construct full path relative to store root
+	fullPath := filepath.Join(s.opts.Root, filePath)
 
-	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
+	file, err := os.OpenFile(fullPath, os.O_RDONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %v", err)
 	}
@@ -202,46 +192,52 @@ func (s *Store) ReadChunk(filePath string, chunkIndex int) ([]byte, error) {
 // ChunkAndStore divides a file into chunks, stores each chunk,
 // and saves metadata about the number of chunks and file ID.
 func (s *Store) ChunkAndStore(fileID, filePath string) (*shared.Metadata, error) {
-	file, err := os.Open(filePath)
+	// Create a subdirectory for this file
+	fileDir := filepath.Join(s.opts.Root, fileID)
+	if err := os.MkdirAll(fileDir, os.ModePerm); err != nil {
+		return nil, fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	// Copy the file into the store
+	storePath := filepath.Join(fileID, filepath.Base(filePath))
+	destPath := filepath.Join(s.opts.Root, storePath)
+
+	src, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %v", err)
+		return nil, fmt.Errorf("failed to open source file: %v", err)
 	}
-	defer file.Close()
+	defer src.Close()
 
-	// Extract the file extension from the file path
-	fileExtension := filepath.Ext(filePath)
+	dst, err := os.Create(destPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create destination file: %v", err)
+	}
+	defer dst.Close()
 
-	// Variable to track the number of chunks created
-	chunkIndex := 0
-
-	// Read and store chunks
-	for {
-		buf := make([]byte, ChunkSize)
-		n, err := file.Read(buf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read chunk: %v", err)
-		}
-
-		// Define the chunk file name based on the file ID and chunk index
-		chunkFileName := fmt.Sprintf("%s_chunk_%d", fileID, chunkIndex)
-		if _, err := s.writeChunk(fileID, chunkFileName, fileExtension, buf[:n]); err != nil {
-			return nil, fmt.Errorf("failed to write chunk: %v", err)
-		}
-		chunkIndex++
+	if _, err := io.Copy(dst, src); err != nil {
+		return nil, fmt.Errorf("failed to copy file: %v", err)
 	}
 
-	// Create metadata to store the file details
+	// Create metadata
 	meta := &shared.Metadata{
 		FileID:        fileID,
-		NumChunks:     chunkIndex,
-		FileExtension: fileExtension,
+		FileExtension: filepath.Ext(filePath),
+		OriginalPath:  storePath, // Store relative path from store root
 		ChunkSize:     ChunkSize,
 	}
 
-	// Save metadata as JSON in the store
+	// Calculate chunks and hashes
+	chunkHashes, totalHash, totalSize, err := generateFileHashes(destPath, ChunkSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate hashes: %v", err)
+	}
+
+	meta.ChunkHashes = chunkHashes
+	meta.TotalHash = totalHash
+	meta.TotalSize = totalSize
+	meta.NumChunks = len(chunkHashes)
+
+	// Save metadata
 	if err := s.saveMetadata(meta); err != nil {
 		return nil, fmt.Errorf("failed to save metadata: %v", err)
 	}
