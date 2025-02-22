@@ -286,7 +286,7 @@ type CleanupConfig struct {
 // DefaultCleanupConfig returns the default cleanup configuration
 func DefaultCleanupConfig() CleanupConfig {
 	return CleanupConfig{
-		InactivityThreshold: 5 * time.Second,  // Reduced from 2 minutes
+		InactivityThreshold: 60 * time.Second,  // Reduced from 2 minutes
 		CleanupInterval:     5 * time.Second, // Reduced from 30 seconds
 	}
 }
