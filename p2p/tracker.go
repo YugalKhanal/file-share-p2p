@@ -160,31 +160,42 @@ func (t *Tracker) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Update peer's last seen timestamp
 	t.peerLastSeen[heartbeat.PeerAddr] = time.Now()
 
-	// Verify that the peer is still sharing all claimed files
+	// Track which files the peer is currently sharing
+	currentlySharing := make(map[string]bool)
 	for _, fileID := range heartbeat.FileIDs {
-		if peers, exists := t.peerIndex[fileID]; exists {
-			peers[heartbeat.PeerAddr] = true
+		currentlySharing[fileID] = true
+
+		// Initialize peer list for this file if it doesn't exist
+		if _, exists := t.peerIndex[fileID]; !exists {
+			t.peerIndex[fileID] = make(map[string]bool)
+		}
+
+		// Add peer to the file's peer list
+		t.peerIndex[fileID][heartbeat.PeerAddr] = true
+
+		// Update peer count in file info
+		if info, exists := t.fileIndex[fileID]; exists {
+			info.NumPeers = len(t.peerIndex[fileID])
+			log.Printf("Updated peer count for file %s: %d peers", fileID, info.NumPeers)
 		}
 	}
 
-	// Check for files the peer is no longer sharing
+	// Remove peer from files it's no longer sharing
 	for fileID, peers := range t.peerIndex {
-		if peers[heartbeat.PeerAddr] {
-			stillSharing := false
-			for _, activeFileID := range heartbeat.FileIDs {
-				if activeFileID == fileID {
-					stillSharing = true
-					break
-				}
-			}
-			if !stillSharing {
-				delete(peers, heartbeat.PeerAddr)
-				if info, exists := t.fileIndex[fileID]; exists {
-					info.NumPeers = len(peers)
-					if info.NumPeers == 0 {
-						delete(t.fileIndex, fileID)
-						delete(t.peerIndex, fileID)
-					}
+		if peers[heartbeat.PeerAddr] && !currentlySharing[fileID] {
+			delete(peers, heartbeat.PeerAddr)
+			log.Printf("Peer %s stopped sharing file %s", heartbeat.PeerAddr, fileID)
+
+			// Update file info
+			if info, exists := t.fileIndex[fileID]; exists {
+				info.NumPeers = len(peers)
+				// Remove file if no peers are sharing it
+				if info.NumPeers == 0 {
+					delete(t.fileIndex, fileID)
+					delete(t.peerIndex, fileID)
+					log.Printf("Removed file %s as it has no active peers", fileID)
+				} else {
+					log.Printf("Updated peer count for file %s: %d peers", fileID, info.NumPeers)
 				}
 			}
 		}
@@ -275,8 +286,8 @@ type CleanupConfig struct {
 // DefaultCleanupConfig returns the default cleanup configuration
 func DefaultCleanupConfig() CleanupConfig {
 	return CleanupConfig{
-		InactivityThreshold: 2 * time.Minute,
-		CleanupInterval:     30 * time.Second,
+		InactivityThreshold: 1 * time.Minute,  // Reduced from 2 minutes
+		CleanupInterval:     15 * time.Second, // Reduced from 30 seconds
 	}
 }
 
@@ -306,21 +317,21 @@ func (t *Tracker) cleanupInactivePeers(threshold time.Duration) {
 		}
 	}
 
-	// Remove inactive peers from all data structures
+	// Process each removed peer
 	for _, peerAddr := range removedPeers {
 		// Remove from lastSeen tracker
 		delete(t.peerLastSeen, peerAddr)
 
-		// Remove from all file peer lists and update counts
+		// Remove from all file peer lists and update metadata
 		for fileID, peers := range t.peerIndex {
 			if peers[peerAddr] {
 				delete(peers, peerAddr)
+				log.Printf("Removed inactive peer %s from file %s", peerAddr, fileID)
 
-				// Update file info peer count
+				// Update file info
 				if info, exists := t.fileIndex[fileID]; exists {
 					info.NumPeers = len(peers)
-
-					// If no peers left sharing this file, remove it
+					// Clean up files with no peers
 					if info.NumPeers == 0 {
 						delete(t.fileIndex, fileID)
 						delete(t.peerIndex, fileID)
@@ -329,6 +340,14 @@ func (t *Tracker) cleanupInactivePeers(threshold time.Duration) {
 						log.Printf("Updated peer count for file %s: %d peers", fileID, info.NumPeers)
 					}
 				}
+			}
+		}
+
+		// Clean up empty peer lists
+		for fileID, peers := range t.peerIndex {
+			if len(peers) == 0 {
+				delete(t.peerIndex, fileID)
+				log.Printf("Removed empty peer list for file %s", fileID)
 			}
 		}
 
