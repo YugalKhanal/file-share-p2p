@@ -14,8 +14,7 @@ import (
 	"time"
 )
 
-// Tracker stores metadata and peer information for each file
-// In tracker.go, update the FileInfo struct
+// stores metadata and peer information for each file
 type FileInfo struct {
 	FileID      string    `json:"file_id"`
 	Name        string    `json:"name"`
@@ -32,6 +31,7 @@ type FileInfo struct {
 	TotalSize   int64     `json:"total_size"`
 }
 
+// Tracker stores metadata and peer information for each file
 type Tracker struct {
 	fileIndex    map[string]*FileInfo       // fileID -> file metadata
 	peerIndex    map[string]map[string]bool // fileID -> peer addresses
@@ -60,7 +60,6 @@ func (t *Tracker) StartTracker(address string) {
 
 // handleAnnounce handles peers announcing the files they have
 // Endpoint: /announce?file_id=<fileID>&peer_addr=<peerAddr>
-// In tracker.go, update the announcement struct and HandleAnnounce
 func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -90,11 +89,9 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Clean up stale peers
-	t.cleanupStalePeers()
-
-	// Update file info
-	if _, exists := t.fileIndex[announce.FileID]; !exists {
+	// Update file info if it doesn't exist or if it's changed
+	existingFile, exists := t.fileIndex[announce.FileID]
+	if !exists || existingFile.TotalHash != announce.TotalHash {
 		t.fileIndex[announce.FileID] = &FileInfo{
 			FileID:      announce.FileID,
 			Name:        announce.Name,
@@ -111,15 +108,22 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Update peer info
+	// Initialize peer list for this file if it doesn't exist
 	if _, exists := t.peerIndex[announce.FileID]; !exists {
 		t.peerIndex[announce.FileID] = make(map[string]bool)
 	}
+
+	// Add peer to the file's peer list
 	t.peerIndex[announce.FileID][announce.PeerAddr] = true
+
+	// Update peer's last seen timestamp
 	t.peerLastSeen[announce.PeerAddr] = time.Now()
 
 	// Update peer count
 	t.fileIndex[announce.FileID].NumPeers = len(t.peerIndex[announce.FileID])
+
+	log.Printf("Peer %s announced file %s (Total peers: %d)",
+		announce.PeerAddr, announce.FileID, t.fileIndex[announce.FileID].NumPeers)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -134,14 +138,82 @@ func contains(slice []string, str string) bool {
 	return false
 }
 
-// In tracker.go, add this new handler
+func (t *Tracker) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var heartbeat struct {
+		PeerAddr string   `json:"peer_addr"`
+		FileIDs  []string `json:"file_ids"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Update peer's last seen timestamp
+	t.peerLastSeen[heartbeat.PeerAddr] = time.Now()
+
+	// Track which files the peer is currently sharing
+	currentlySharing := make(map[string]bool)
+	for _, fileID := range heartbeat.FileIDs {
+		currentlySharing[fileID] = true
+
+		// Initialize peer list for this file if it doesn't exist
+		if _, exists := t.peerIndex[fileID]; !exists {
+			t.peerIndex[fileID] = make(map[string]bool)
+		}
+
+		// Add peer to the file's peer list
+		t.peerIndex[fileID][heartbeat.PeerAddr] = true
+
+		// Update peer count in file info
+		if info, exists := t.fileIndex[fileID]; exists {
+			info.NumPeers = len(t.peerIndex[fileID])
+			log.Printf("Updated peer count for file %s: %d peers", fileID, info.NumPeers)
+		}
+	}
+
+	// Remove peer from files it's no longer sharing
+	for fileID, peers := range t.peerIndex {
+		if peers[heartbeat.PeerAddr] && !currentlySharing[fileID] {
+			delete(peers, heartbeat.PeerAddr)
+			log.Printf("Peer %s stopped sharing file %s", heartbeat.PeerAddr, fileID)
+
+			// Update file info
+			if info, exists := t.fileIndex[fileID]; exists {
+				info.NumPeers = len(peers)
+				// Remove file if no peers are sharing it
+				if info.NumPeers == 0 {
+					delete(t.fileIndex, fileID)
+					delete(t.peerIndex, fileID)
+					log.Printf("Removed file %s as it has no active peers", fileID)
+				} else {
+					log.Printf("Updated peer count for file %s: %d peers", fileID, info.NumPeers)
+				}
+			}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// HandleGetMetadata handles requests by peers for file metadata
 func (t *Tracker) HandleGetMetadata(w http.ResponseWriter, r *http.Request) {
 	fileID := r.URL.Query().Get("file_id")
+	//no fileID provided
 	if fileID == "" {
 		http.Error(w, "file_id is required", http.StatusBadRequest)
 		return
 	}
 
+	//lock the tracker
 	t.mu.RLock()
 	fileInfo, exists := t.fileIndex[fileID]
 	t.mu.RUnlock()
@@ -155,6 +227,7 @@ func (t *Tracker) HandleGetMetadata(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(fileInfo)
 }
 
+// HandleListFiles handles requests by peers to list all available files
 func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -204,43 +277,92 @@ func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// CleanupConfig holds configuration for the cleanup process
+type CleanupConfig struct {
+	InactivityThreshold time.Duration
+	CleanupInterval     time.Duration
+}
+
+// DefaultCleanupConfig returns the default cleanup configuration
+func DefaultCleanupConfig() CleanupConfig {
+	return CleanupConfig{
+		InactivityThreshold: 30 * time.Second,  // Reduced from 2 minutes
+		CleanupInterval:     2 * time.Second, // Reduced from 30 seconds
+	}
+}
+
+// StartCleanupLoop starts the periodic cleanup of inactive peers
 func (t *Tracker) StartCleanupLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	config := DefaultCleanupConfig()
+	ticker := time.NewTicker(config.CleanupInterval)
 	go func() {
 		for range ticker.C {
-			t.cleanupInactivePeers()
+			t.cleanupInactivePeers(config.InactivityThreshold)
 		}
 	}()
 }
 
-func (t *Tracker) cleanupInactivePeers() {
+// cleanupInactivePeers removes peers that haven't announced within the threshold
+func (t *Tracker) cleanupInactivePeers(threshold time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	threshold := time.Now().Add(-30 * time.Minute)
+	now := time.Now()
+	var removedPeers []string
 
+	// Find inactive peers
 	for peerAddr, lastSeen := range t.peerLastSeen {
-		if lastSeen.Before(threshold) {
-			// Remove inactive peer
-			for fileID, peers := range t.peerIndex {
-				if peers[peerAddr] {
-					delete(peers, peerAddr)
-					// Update peer count
-					if info, exists := t.fileIndex[fileID]; exists {
-						info.NumPeers = len(peers)
-						// Remove file if no peers are sharing it
-						if info.NumPeers == 0 {
-							delete(t.fileIndex, fileID)
-							delete(t.peerIndex, fileID)
-						}
+		if now.Sub(lastSeen) > threshold {
+			removedPeers = append(removedPeers, peerAddr)
+		}
+	}
+
+	// Process each removed peer
+	for _, peerAddr := range removedPeers {
+		// Remove from lastSeen tracker
+		delete(t.peerLastSeen, peerAddr)
+
+		// Remove from all file peer lists and update metadata
+		for fileID, peers := range t.peerIndex {
+			if peers[peerAddr] {
+				delete(peers, peerAddr)
+				log.Printf("Removed inactive peer %s from file %s", peerAddr, fileID)
+
+				// Update file info
+				if info, exists := t.fileIndex[fileID]; exists {
+					info.NumPeers = len(peers)
+					// Clean up files with no peers
+					if info.NumPeers == 0 {
+						delete(t.fileIndex, fileID)
+						delete(t.peerIndex, fileID)
+						log.Printf("Removed file %s as it has no active peers", fileID)
+					} else {
+						log.Printf("Updated peer count for file %s: %d peers", fileID, info.NumPeers)
 					}
 				}
 			}
-			delete(t.peerLastSeen, peerAddr)
 		}
+
+		// Clean up empty peer lists
+		for fileID, peers := range t.peerIndex {
+			if len(peers) == 0 {
+				delete(t.peerIndex, fileID)
+				log.Printf("Removed empty peer list for file %s", fileID)
+			}
+		}
+
+		log.Printf("Removed inactive peer: %s", peerAddr)
 	}
 }
 
+// UpdatePeerActivity updates the last seen timestamp for a peer
+func (t *Tracker) UpdatePeerActivity(peerAddr string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.peerLastSeen[peerAddr] = time.Now()
+}
+
+// SetupUPnP sets up port forwarding using UPnP
 func setupUPnP(port int) error {
 	clients, errors, err := internetgateway2.NewWANIPConnection1Clients()
 	if err != nil {
@@ -288,6 +410,7 @@ func setupUPnP(port int) error {
 	return fmt.Errorf("failed to set up UPnP port mapping on port %d", port)
 }
 
+// HandleGetPeers handles requests by peers to get a list of peers for a file
 func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	fileID := r.URL.Query().Get("file_id")
 
@@ -326,6 +449,7 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// cleanupStalePeers removes peers that have not sent a heartbeat in the last 2 minutes
 func (t *Tracker) cleanupStalePeers() {
 	threshold := time.Now().Add(-2 * time.Minute) // Consider peers stale after 2 minute
 

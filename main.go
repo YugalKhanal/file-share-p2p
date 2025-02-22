@@ -23,6 +23,7 @@ func main() {
 	// In main.go, update the startTracker block
 	if *startTracker {
 		tracker := p2p.NewTracker()
+		http.HandleFunc("/heartbeat", tracker.HandleHeartbeat)
 		http.HandleFunc("/files", tracker.HandleListFiles)
 		http.HandleFunc("/announce", tracker.HandleAnnounce)
 		http.HandleFunc("/peers", tracker.HandleGetPeers)

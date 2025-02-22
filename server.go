@@ -20,7 +20,6 @@ import (
 
 	"github.com/anthdm/foreverstore/p2p"
 	"github.com/anthdm/foreverstore/shared"
-	// "github.com/anthdm/foreverstore/shared"
 )
 
 type FileServerOpts struct {
@@ -50,12 +49,11 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 		HandshakeFunc: p2p.NOPHandshakeFunc,
 		Decoder:       p2p.DefaultDecoder{},
 	}
+
 	transport := p2p.NewTCPTransport(tcpOpts)
 
 	opts := FileServerOpts{
-		ListenAddr: listenAddr,
-		// ListenAddr:        "localhost:3000",
-		EncKey:            newEncryptionKey(),
+		ListenAddr:        listenAddr,
 		StorageRoot:       "shared_files",
 		PathTransformFunc: DefaultPathTransformFunc,
 		Transport:         transport,
@@ -74,46 +72,52 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	return server
 }
 
-// Fetches the public IP address of the server
-// Add this to the utility functions
-func getPublicIP() (string, error) {
-	resp, err := http.Get("https://api.ipify.org?format=text")
-	if err != nil {
-		return "", err
+func isPrivateIP(ip net.IP) bool {
+	privateCIDRs := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
 	}
-	defer resp.Body.Close()
-
-	ip, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(ip), nil
-}
-
-func getLocalIP() (string, error) {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "", err
-	}
-
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-			return ipNet.IP.String(), nil
+	for _, cidr := range privateCIDRs {
+		_, subnet, _ := net.ParseCIDR(cidr)
+		if subnet.Contains(ip) {
+			return true
 		}
 	}
-	return "", fmt.Errorf("no local IP found")
+	return ip.IsLoopback()
+}
+
+func filterPeerList(peerList []string) []string {
+	var filtered []string
+	for _, peer := range peerList {
+		addresses := strings.Split(peer, "|")
+		for _, addr := range addresses {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				continue
+			}
+			ip := net.ParseIP(host)
+			if ip != nil && !isPrivateIP(ip) {
+				filtered = append(filtered, addr)
+			}
+		}
+	}
+	if len(filtered) == 0 {
+		log.Printf("Warning: No public IP peers found, falling back to all peers")
+		return peerList // fallback to all peers
+	}
+	return filtered
 }
 
 // Determines the peer's full address, combining the detected IP with the listening port
 func getPeerAddress(listenAddr string) (string, error) {
 	// Get both public and local IPs
-	publicIP, err := getPublicIP()
+	publicIP, err := shared.GetPublicIP()
 	if err != nil {
 		return "", fmt.Errorf("failed to get public IP: %v", err)
 	}
 
-	localIP, err := getLocalIP()
+	localIP, err := shared.GetLocalIP()
 	if err != nil {
 		return "", fmt.Errorf("failed to get local IP: %v", err)
 	}
@@ -151,6 +155,7 @@ func (s *FileServer) refreshPeers(fileID string) error {
 	}
 
 	var peerList []string
+	peerList = filterPeerList(peerList)
 	if err := json.NewDecoder(resp.Body).Decode(&peerList); err != nil {
 		return fmt.Errorf("failed to decode peer list: %v", err)
 	}
