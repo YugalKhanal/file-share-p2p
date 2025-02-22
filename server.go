@@ -677,7 +677,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	// Get metadata from tracker
 	meta, err := s.getMetadataFromTracker(fileID)
 	if err != nil {
-		return fmt.Errorf("failed to get metadata from tracker: %v", err)
+		return fmt.Errorf("file not found: %s (error: %v)", fileID, err)
 	}
 
 	// Save metadata locally
@@ -685,16 +685,26 @@ func (s *FileServer) DownloadFile(fileID string) error {
 		return fmt.Errorf("failed to save metadata locally: %v", err)
 	}
 
+	// First refresh of peers
 	if err := s.refreshPeers(fileID); err != nil {
-		return fmt.Errorf("failed to get peers from tracker: %v", err)
+		return fmt.Errorf("no peers are currently sharing file %s", fileID)
 	}
 
+	// Second refresh of peers (keeping both as in original code)
 	if err := s.refreshPeers(fileID); err != nil {
-		return fmt.Errorf("failed to get peers from tracker: %v", err)
+		return fmt.Errorf("no peers are currently sharing file %s", fileID)
 	}
 
 	// Wait a bit for connections to establish
 	time.Sleep(2 * time.Second)
+
+	// Check if we have any peers after connection attempts
+	s.mu.RLock()
+	peerCount := len(s.peers)
+	s.mu.RUnlock()
+	if peerCount == 0 {
+		return fmt.Errorf("unable to connect to any peers for file %s - the file exists but no seeders are reachable", fileID)
+	}
 
 	// Initialize piece manager
 	pieceManager := NewPieceManager(meta.NumChunks, meta.ChunkHashes)
@@ -783,6 +793,10 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	activeDownloads := make(map[int]bool)
 	var activeMutex sync.Mutex
 
+	// Track if we've received any successful chunk downloads
+	var receivedAnyChunks bool
+	var receivedChunksMutex sync.Mutex
+
 	// Main download loop
 	for !pieceManager.IsComplete() {
 		// Get available peers
@@ -797,6 +811,13 @@ func (s *FileServer) DownloadFile(fileID string) error {
 			// No peers available, try to refresh peers
 			if err := s.refreshPeers(fileID); err != nil {
 				log.Printf("Failed to refresh peers: %v", err)
+				// Check if we never received any chunks
+				receivedChunksMutex.Lock()
+				if !receivedAnyChunks {
+					receivedChunksMutex.Unlock()
+					return fmt.Errorf("no active seeders found for file %s - the file exists but no one is currently sharing it", fileID)
+				}
+				receivedChunksMutex.Unlock()
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -847,11 +868,21 @@ func (s *FileServer) DownloadFile(fileID string) error {
 						progressMutex.Lock()
 						completedPieces++
 						progressMutex.Unlock()
+
+						// Mark that we've received at least one chunk
+						receivedChunksMutex.Lock()
+						receivedAnyChunks = true
+						receivedChunksMutex.Unlock()
 						return
 					}
 
-					log.Printf("Failed to download piece %d from peer %s: %v",
-						p.Index, peer.RemoteAddr(), err)
+					if strings.Contains(err.Error(), "not being actively seeded") {
+						log.Printf("Peer %s is not actively seeding file %s",
+							peer.RemoteAddr(), fileID)
+					} else {
+						log.Printf("Failed to download piece %d from peer %s: %v",
+							p.Index, peer.RemoteAddr(), err)
+					}
 
 					// Remove failed peer from piece manager
 					pieceManager.RemovePeer(peer.RemoteAddr().String())
@@ -869,6 +900,14 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 	// Wait for all downloads to complete
 	wg.Wait()
+
+	// Final check to see if we got any chunks
+	receivedChunksMutex.Lock()
+	if !receivedAnyChunks {
+		receivedChunksMutex.Unlock()
+		return fmt.Errorf("download failed - no seeders are actively sharing file %s", fileID)
+	}
+	receivedChunksMutex.Unlock()
 
 	return nil
 }
