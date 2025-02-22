@@ -737,7 +737,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	}
 	s.mu.RUnlock()
 
-	outputFileName := fmt.Sprintf("downloaded_%s%s", fileID, meta.FileExtension)
+	outputFileName := fmt.Sprintf("downloaded_%s.%s", fileID, strings.TrimPrefix(meta.FileExtension, "."))
 	outputFile, err := os.Create(outputFileName)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %v", err)
