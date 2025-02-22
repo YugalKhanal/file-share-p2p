@@ -156,8 +156,18 @@ func (t *Tracker) HandleGetMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	t.mu.Lock()
+	// Clean up stale peers before listing files
+	t.cleanupStalePeers()
+
+	// Only include files that have active peers
+	activeFiles := make([]*FileInfo, 0)
+	for _, info := range t.fileIndex {
+		if peers, exists := t.peerIndex[info.FileID]; exists && len(peers) > 0 {
+			activeFiles = append(activeFiles, info)
+		}
+	}
+	t.mu.Unlock()
 
 	// Support filtering and pagination
 	category := r.URL.Query().Get("category")
@@ -169,7 +179,7 @@ func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	perPage := 50
 
 	var files []*FileInfo
-	for _, info := range t.fileIndex {
+	for _, info := range activeFiles {
 		// Apply filters
 		if category != "" && !contains(info.Categories, category) {
 			continue
@@ -205,10 +215,12 @@ func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *Tracker) StartCleanupLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(30 * time.Second) // Run cleanup more frequently
 	go func() {
 		for range ticker.C {
-			t.cleanupInactivePeers()
+			t.mu.Lock()
+			t.cleanupStalePeers()
+			t.mu.Unlock()
 		}
 	}()
 }
@@ -290,80 +302,75 @@ func setupUPnP(port int) error {
 
 func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	fileID := r.URL.Query().Get("file_id")
-
 	if fileID == "" {
 		http.Error(w, "file_id is required", http.StatusBadRequest)
 		return
 	}
 
 	t.mu.Lock()
-	// Clean up stale peers before returning the list
+	defer t.mu.Unlock()
+
+	// Clean up stale peers first
 	t.cleanupStalePeers()
 
-	// Get the list of peers for this fileID
+	// Check if file exists and has active peers
 	peers, exists := t.peerIndex[fileID]
-
-	// Create active peers list
-	activePeers := make([]string, 0)
-	if exists {
-		threshold := time.Now().Add(-2 * time.Minute)
-		for peer := range peers {
-			// Only include peers that have recently announced this file
-			if lastSeen, ok := t.peerLastSeen[peer]; ok && lastSeen.After(threshold) {
-				activePeers = append(activePeers, peer)
-			}
-		}
-	}
-	t.mu.Unlock()
-
-	// Always return a JSON response
-	w.Header().Set("Content-Type", "application/json")
-
-	if len(activePeers) == 0 {
-		log.Printf("No active peers found for file %s", fileID)
+	if !exists || len(peers) == 0 {
+		// Return empty array and 404 status
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode([]string{})
 		return
 	}
 
-	log.Printf("Active peers for file %s: %v", fileID, activePeers)
-	if err := json.NewEncoder(w).Encode(activePeers); err != nil {
-		http.Error(w, "Failed to encode peer list", http.StatusInternalServerError)
+	// Convert the peer map to a list
+	peerList := make([]string, 0, len(peers))
+	for peer := range peers {
+		// Double check the peer is still active
+		if lastSeen, ok := t.peerLastSeen[peer]; ok && lastSeen.After(time.Now().Add(-1*time.Minute)) {
+			peerList = append(peerList, peer)
+		}
 	}
+
+	// If no active peers found after double-check
+	if len(peerList) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode([]string{})
+		return
+	}
+
+	log.Printf("Active peers for file %s: %v", fileID, peerList)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(peerList)
 }
 
 func (t *Tracker) cleanupStalePeers() {
-	threshold := time.Now().Add(-2 * time.Minute) // Consider peers stale after 2 minutes
+	threshold := time.Now().Add(-1 * time.Minute) // Make timeout shorter - 1 minute
 
-	// Track files that need to be removed
-	filesToRemove := make(map[string]bool)
-
-	// First pass: identify stale peers and remove them
+	// Remove stale peers
 	for peerAddr, lastSeen := range t.peerLastSeen {
 		if lastSeen.Before(threshold) {
-			// Remove stale peer from all files
+			// Remove peer from all files
 			for fileID, peers := range t.peerIndex {
-				if peers[peerAddr] {
-					delete(peers, peerAddr)
+				delete(peers, peerAddr)
 
-					// Update file info
-					if info, exists := t.fileIndex[fileID]; exists {
-						info.NumPeers = len(peers)
-						// Mark file for removal if no peers are sharing it
-						if info.NumPeers == 0 {
-							filesToRemove[fileID] = true
-						}
-					}
+				// Update file info
+				if info, exists := t.fileIndex[fileID]; exists {
+					info.NumPeers = len(peers)
 				}
 			}
 			delete(t.peerLastSeen, peerAddr)
 		}
 	}
 
-	// Second pass: remove files with no peers
-	for fileID := range filesToRemove {
-		delete(t.fileIndex, fileID)
-		delete(t.peerIndex, fileID)
-		log.Printf("Removed file %s from tracker as it has no active peers", fileID)
+	// Remove files with no active peers
+	for fileID := range t.fileIndex {
+		if peers, exists := t.peerIndex[fileID]; !exists || len(peers) == 0 {
+			delete(t.fileIndex, fileID)
+			delete(t.peerIndex, fileID)
+			log.Printf("Removed file %s from tracker as it has no active peers", fileID)
+		}
 	}
 }
 
