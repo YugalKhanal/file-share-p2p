@@ -578,6 +578,74 @@ func (s *FileServer) ShareFile(filePath string) error {
 	return nil
 }
 
+func (s *FileServer) StopSeedingFile(fileID string) {
+	s.activeFilesMu.Lock()
+	delete(s.activeFiles, fileID)
+	s.activeFilesMu.Unlock()
+
+	// Immediately notify tracker that we've stopped seeding
+	if s.opts.TrackerAddr != "" {
+		go func() {
+			peerAddr, err := getPeerAddress(s.opts.ListenAddr)
+			if err != nil {
+				log.Printf("Failed to get peer address: %v", err)
+				return
+			}
+
+			// Create heartbeat message with updated file list
+			s.activeFilesMu.RLock()
+			activeFileIDs := make([]string, 0, len(s.activeFiles))
+			for id := range s.activeFiles {
+				activeFileIDs = append(activeFileIDs, id)
+			}
+			s.activeFilesMu.RUnlock()
+
+			heartbeat := struct {
+				PeerAddr string   `json:"peer_addr"`
+				FileIDs  []string `json:"file_ids"`
+			}{
+				PeerAddr: peerAddr,
+				FileIDs:  activeFileIDs,
+			}
+
+			jsonData, err := json.Marshal(heartbeat)
+			if err != nil {
+				log.Printf("Failed to marshal heartbeat: %v", err)
+				return
+			}
+
+			url := fmt.Sprintf("%s/heartbeat", s.opts.TrackerAddr)
+			resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+			if err != nil {
+				log.Printf("Failed to send heartbeat: %v", err)
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+}
+
+// Add this to server.go
+func (s *FileServer) Cleanup() {
+	log.Printf("Starting cleanup...")
+
+	// Get list of active files
+	s.activeFilesMu.RLock()
+	activeFiles := make([]string, 0, len(s.activeFiles))
+	for fileID := range s.activeFiles {
+		activeFiles = append(activeFiles, fileID)
+	}
+	s.activeFilesMu.RUnlock()
+
+	// Stop seeding each file
+	for _, fileID := range activeFiles {
+		s.StopSeedingFile(fileID)
+	}
+
+	// Close the quit channel
+	close(s.quitch)
+}
+
 func (s *FileServer) generateFileID(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
