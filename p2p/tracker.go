@@ -286,8 +286,8 @@ type CleanupConfig struct {
 // DefaultCleanupConfig returns the default cleanup configuration
 func DefaultCleanupConfig() CleanupConfig {
 	return CleanupConfig{
-		InactivityThreshold: 120 * time.Second,  // Reduced from 2 minutes
-		CleanupInterval:     15 * time.Second, // Reduced from 30 seconds
+		InactivityThreshold: 120 * time.Second, // Reduced from 2 minutes
+		CleanupInterval:     15 * time.Second,  // Reduced from 30 seconds
 	}
 }
 
@@ -447,6 +447,44 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(peerList); err != nil {
 		http.Error(w, "Failed to encode peer list", http.StatusInternalServerError)
 	}
+}
+
+func (t *Tracker) HandleRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		FileID   string `json:"file_id"`
+		PeerAddr string `json:"peer_addr"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Remove peer from file's peer list
+	if peers, exists := t.peerIndex[req.FileID]; exists {
+		delete(peers, req.PeerAddr)
+
+		// Update file info
+		if info, exists := t.fileIndex[req.FileID]; exists {
+			info.NumPeers = len(peers)
+			// Remove file if no peers are sharing it
+			if info.NumPeers == 0 {
+				delete(t.fileIndex, req.FileID)
+				delete(t.peerIndex, req.FileID)
+				log.Printf("Removed file %s as it has no active peers", req.FileID)
+			}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // cleanupStalePeers removes peers that have not sent a heartbeat in the last 2 minutes

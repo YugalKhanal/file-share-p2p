@@ -578,6 +578,49 @@ func (s *FileServer) ShareFile(filePath string) error {
 	return nil
 }
 
+func (s *FileServer) StopSharingFile(fileID string) error {
+	s.activeFilesMu.Lock()
+	delete(s.activeFiles, fileID)
+	s.activeFilesMu.Unlock()
+
+	// Immediately notify tracker that we've stopped sharing
+	if s.opts.TrackerAddr != "" {
+		url := fmt.Sprintf("%s/remove", s.opts.TrackerAddr)
+		data := struct {
+			FileID   string `json:"file_id"`
+			PeerAddr string `json:"peer_addr"`
+		}{
+			FileID:   fileID,
+			PeerAddr: s.opts.ListenAddr,
+		}
+
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			return fmt.Errorf("failed to marshal remove request: %v", err)
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return fmt.Errorf("failed to create remove request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to send remove request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("tracker returned error: %s", string(body))
+		}
+	}
+
+	return nil
+}
+
 func (s *FileServer) generateFileID(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
