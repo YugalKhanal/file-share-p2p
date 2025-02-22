@@ -73,6 +73,15 @@ func NewStore(opts StoreOpts) *Store {
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
 	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
 
+	// First check if we're actively sharing this file
+	s.activeFilesMu.RLock()
+	activeMeta, isActive := s.activeFiles[req.FileID]
+	s.activeFilesMu.RUnlock()
+
+	if !isActive {
+		return fmt.Errorf("file %s is not actively shared by this peer", req.FileID)
+	}
+
 	// Add flow control - check if we're already sending too many chunks
 	const maxConcurrentChunks = 5
 	s.mu.Lock()
@@ -82,32 +91,18 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return fmt.Errorf("too many active chunk transfers")
 	}
 
-	// Validate and get metadata
-	s.activeFilesMu.RLock()
-	activeMeta, isActive := s.activeFiles[req.FileID]
-	s.activeFilesMu.RUnlock()
-
-	var meta *shared.Metadata
-	var err error
-	if isActive {
-		meta = activeMeta
-	} else {
-		meta, err = s.store.GetMetadata(req.FileID)
-		if err != nil {
-			log.Printf("Error getting metadata: %v", err)
-			return fmt.Errorf("file metadata not found: %v", err)
-		}
-	}
-
-	if req.Chunk >= meta.NumChunks {
+	// Validate chunk index
+	if req.Chunk >= activeMeta.NumChunks {
 		return fmt.Errorf("invalid chunk index %d, file only has %d chunks",
-			req.Chunk, meta.NumChunks)
+			req.Chunk, activeMeta.NumChunks)
 	}
 
 	// Read chunk with retry logic
 	var chunkData []byte
+	var err error
 	for retries := 0; retries < 3; retries++ {
-		chunkData, err = s.store.ReadChunk(meta.OriginalPath, req.Chunk)
+		// Important: Use the OriginalPath from activeMeta, not directly from disk
+		chunkData, err = s.store.ReadChunk(activeMeta.OriginalPath, req.Chunk)
 		if err == nil {
 			break
 		}
@@ -156,6 +151,19 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 }
 
 func (s *Store) ReadChunk(filePath string, chunkIndex int) ([]byte, error) {
+	// Validate file path is within store directory
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid file path: %v", err)
+	}
+	storeRoot, err := filepath.Abs(s.opts.Root)
+	if err != nil {
+		return nil, fmt.Errorf("invalid store root: %v", err)
+	}
+	if !strings.HasPrefix(absPath, storeRoot) {
+		return nil, fmt.Errorf("attempt to access file outside store directory")
+	}
+
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %v", err)
