@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -246,11 +245,15 @@ func (s *FileServer) consumeRPCMessages() {
 }
 
 func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, outputFile *os.File) error {
-	// Track retry attempts per piece
 	maxRetries := 3
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("Retrying chunk %d download (attempt %d/%d)", chunkIndex, attempt+1, maxRetries)
+			time.Sleep(time.Second * time.Duration(attempt+1))
+		}
+
 		// Get current list of peers and shuffle them
 		s.mu.RLock()
 		peers := make([]p2p.Peer, 0, len(s.peers))
@@ -262,7 +265,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		if len(peers) == 0 {
 			// Try to refresh peers if none available
 			if err := s.refreshPeers(fileID); err != nil {
-				time.Sleep(time.Second * time.Duration(attempt+1))
+				lastErr = fmt.Errorf("failed to refresh peers: %v", err)
 				continue
 			}
 			s.mu.RLock()
@@ -271,134 +274,130 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			}
 			s.mu.RUnlock()
 			if len(peers) == 0 {
+				lastErr = fmt.Errorf("no peers available for file %s", fileID)
 				continue
 			}
 		}
 
-		// Randomize peer order for better load distribution
-		rand.Shuffle(len(peers), func(i, j int) {
-			peers[i], peers[j] = peers[j], peers[i]
-		})
-
-		// Try each peer for this attempt
+		// Try each peer until successful
 		for _, peer := range peers {
-			responseChan := make(chan p2p.MessageChunkResponse, 1)
-			errChan := make(chan error, 1)
-			done := make(chan struct{})
-
-			// Set up response handler
-			s.mu.Lock()
-			// handlerIndex := len(s.responseHandlers)
-			s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
-				select {
-				case <-done:
-					return
-				default:
-				}
-
-				if msg.Type != p2p.MessageTypeChunkResponse {
-					return
-				}
-
-				var resp p2p.MessageChunkResponse
-				switch payload := msg.Payload.(type) {
-				case p2p.MessageChunkResponse:
-					resp = payload
-				case *p2p.MessageChunkResponse:
-					resp = *payload
-				default:
-					select {
-					case errChan <- fmt.Errorf("invalid payload type: %T", msg.Payload):
-					default:
-					}
-					return
-				}
-
-				if resp.FileID != fileID || resp.Chunk != chunkIndex {
-					return
-				}
-
-				select {
-				case responseChan <- resp:
-				default:
-				}
-			})
-			s.mu.Unlock()
-
-			// Send request
-			msg := p2p.NewChunkRequestMessage(fileID, chunkIndex)
-			var buf bytes.Buffer
-			if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
-				close(done)
+			data, err := s.downloadChunkFromPeer(peer, fileID, chunkIndex, chunkSize)
+			if err != nil {
+				log.Printf("Failed to download chunk %d from peer %s: %v", chunkIndex, peer.RemoteAddr(), err)
 				continue
 			}
 
-			if err := peer.Send(buf.Bytes()); err != nil {
-				log.Printf("Failed to send request to peer %s: %v", peer.RemoteAddr(), err)
-				close(done)
+			// Verify chunk size
+			if len(data) > chunkSize {
+				log.Printf("Received oversized chunk %d from peer %s: %d > %d", chunkIndex, peer.RemoteAddr(), len(data), chunkSize)
 				continue
 			}
 
-			// Wait for response with adaptive timeout
-			timeout := 30 * time.Second
-			if chunkSize > 16*1024*1024 {
-				timeout = time.Duration(chunkSize/(2*1024*1024)) * time.Second
-			}
-
-			// Add exponential backoff
-			timeout += time.Duration(attempt*5) * time.Second
-
-			select {
-			case resp := <-responseChan:
-				if err := writeAndVerifyChunk(resp.Data, outputFile, chunkIndex, chunkSize); err != nil {
-					lastErr = fmt.Errorf("chunk write failed from peer %s: %v", peer.RemoteAddr(), err)
-					close(done)
-					continue
-				}
-				close(done)
-				return nil
-
-			case err := <-errChan:
-				lastErr = fmt.Errorf("download failed from peer %s: %v", peer.RemoteAddr(), err)
-				close(done)
-
-				// Remove failed peer
-				s.mu.Lock()
-				delete(s.peers, peer.RemoteAddr().String())
-				s.mu.Unlock()
-
-				continue
-
-			case <-time.After(timeout):
-				lastErr = fmt.Errorf("timeout waiting for peer %s", peer.RemoteAddr())
-				close(done)
+			// Write chunk to file
+			if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
+				log.Printf("Failed to write chunk %d: %v", chunkIndex, err)
 				continue
 			}
-		}
 
-		// If we got here, all peers failed for this attempt
-		if attempt < maxRetries-1 {
-			log.Printf("All peers failed for piece %d, attempt %d/%d. Last error: %v",
-				chunkIndex, attempt+1, maxRetries, lastErr)
-			time.Sleep(time.Second * time.Duration(attempt+1))
-			continue
+			return nil
 		}
 	}
 
-	return fmt.Errorf("all peers failed after %d attempts. last error: %v", maxRetries, lastErr)
+	return fmt.Errorf("failed to download chunk after %d attempts: %v", maxRetries, lastErr)
+}
+
+func (s *FileServer) downloadChunkFromPeer(peer p2p.Peer, fileID string, chunkIndex, chunkSize int) ([]byte, error) {
+	// Create response channels
+	responseChan := make(chan []byte, 1)
+	errChan := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done)
+
+	// Set up response handler
+	s.mu.Lock()
+	handlerIndex := len(s.responseHandlers)
+	s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		if msg.Type != p2p.MessageTypeChunkResponse {
+			return
+		}
+
+		var resp p2p.MessageChunkResponse
+		switch payload := msg.Payload.(type) {
+		case p2p.MessageChunkResponse:
+			resp = payload
+		case *p2p.MessageChunkResponse:
+			resp = *payload
+		default:
+			errChan <- fmt.Errorf("invalid payload type: %T", msg.Payload)
+			return
+		}
+
+		if resp.FileID != fileID || resp.Chunk != chunkIndex {
+			return
+		}
+
+		select {
+		case responseChan <- resp.Data:
+		default:
+		}
+	})
+	s.mu.Unlock()
+
+	// Clean up handler when we're done
+	defer func() {
+		s.mu.Lock()
+		if handlerIndex < len(s.responseHandlers) {
+			s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
+		}
+		s.mu.Unlock()
+	}()
+
+	// Send request
+	msg := p2p.NewChunkRequestMessage(fileID, chunkIndex)
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
+		return nil, err
+	}
+
+	if err := peer.Send(buf.Bytes()); err != nil {
+		return nil, fmt.Errorf("failed to send request: %v", err)
+	}
+
+	// Wait for response with timeout
+	timeout := 30 * time.Second
+	if chunkSize > 16*1024*1024 {
+		timeout = time.Duration(chunkSize/(2*1024*1024)) * time.Second
+	}
+
+	select {
+	case data := <-responseChan:
+		return data, nil
+	case err := <-errChan:
+		return nil, err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("timeout waiting for response")
+	}
 }
 
 func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int) error {
 	startOffset := int64(chunkIndex * chunkSize)
 
-	// Verify chunk size
-	if len(data) > chunkSize {
-		return fmt.Errorf("oversized chunk data")
+	// Calculate padded data if this is the last chunk
+	paddedData := data
+	if len(data) < chunkSize {
+		paddedData = make([]byte, chunkSize)
+		copy(paddedData, data)
 	}
 
 	// Write chunk with retry
 	for retries := 0; retries < 3; retries++ {
-		written, err := output.WriteAt(data, startOffset)
+		written, err := output.WriteAt(paddedData, startOffset)
 		if err != nil {
 			if retries < 2 {
 				time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
@@ -407,17 +406,34 @@ func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int
 			return fmt.Errorf("write error: %v", err)
 		}
 
-		if written != len(data) {
+		if written != len(paddedData) {
 			if retries < 2 {
 				continue
 			}
-			return fmt.Errorf("incomplete write: %d of %d bytes", written, len(data))
+			return fmt.Errorf("incomplete write: %d of %d bytes", written, len(paddedData))
+		}
+
+		// Verify written data
+		verifyBuf := make([]byte, len(paddedData))
+		n, err := output.ReadAt(verifyBuf, startOffset)
+		if err != nil || n != len(paddedData) {
+			if retries < 2 {
+				continue
+			}
+			return fmt.Errorf("verification read failed: %v", err)
+		}
+
+		if !bytes.Equal(verifyBuf, paddedData) {
+			if retries < 2 {
+				continue
+			}
+			return fmt.Errorf("verification mismatch")
 		}
 
 		return nil
 	}
 
-	return fmt.Errorf("failed to write chunk after retries")
+	return fmt.Errorf("failed to write and verify chunk after retries")
 }
 
 // New method to handle RPC messages

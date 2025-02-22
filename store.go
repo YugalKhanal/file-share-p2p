@@ -73,26 +73,26 @@ func NewStore(opts StoreOpts) *Store {
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
 	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
 
-	// First check if we're actively sharing this file
+	// First verify that we are actually seeding this file
 	s.activeFilesMu.RLock()
-	activeMeta, isActive := s.activeFiles[req.FileID]
+	metadata, isSeeding := s.activeFiles[req.FileID]
 	s.activeFilesMu.RUnlock()
 
-	if !isActive {
-		return fmt.Errorf("file %s is not actively shared by this peer", req.FileID)
+	if !isSeeding {
+		return fmt.Errorf("not seeding file %s", req.FileID)
 	}
 
 	// Validate chunk index
-	if req.Chunk >= activeMeta.NumChunks {
+	if req.Chunk >= metadata.NumChunks {
 		return fmt.Errorf("invalid chunk index %d, file only has %d chunks",
-			req.Chunk, activeMeta.NumChunks)
+			req.Chunk, metadata.NumChunks)
 	}
 
 	// Read chunk with retry logic
 	var chunkData []byte
 	var err error
 	for retries := 0; retries < 3; retries++ {
-		chunkData, err = s.store.ReadChunk(activeMeta.OriginalPath, req.Chunk)
+		chunkData, err = s.store.ReadChunk(metadata.OriginalPath, req.Chunk)
 		if err == nil {
 			break
 		}
@@ -103,7 +103,15 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return fmt.Errorf("failed to read chunk after retries: %v", err)
 	}
 
-	// Send chunk response
+	// Verify chunk hash before sending
+	if len(metadata.ChunkHashes) > req.Chunk {
+		actualHash := calculateHash(chunkData)
+		if actualHash != metadata.ChunkHashes[req.Chunk] {
+			return fmt.Errorf("chunk hash verification failed")
+		}
+	}
+
+	// Send chunk
 	msg := p2p.NewChunkResponseMessage(req.FileID, req.Chunk, chunkData)
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
@@ -114,6 +122,7 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return fmt.Errorf("failed to send chunk: %v", err)
 	}
 
+	log.Printf("Successfully sent chunk %d (%d bytes)", req.Chunk, len(chunkData))
 	return nil
 }
 

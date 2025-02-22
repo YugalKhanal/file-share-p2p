@@ -302,26 +302,31 @@ func (t *Tracker) HandleGetPeers(w http.ResponseWriter, r *http.Request) {
 
 	// Get the list of peers for this fileID
 	peers, exists := t.peerIndex[fileID]
+
+	// Create active peers list
+	activePeers := make([]string, 0)
+	if exists {
+		threshold := time.Now().Add(-2 * time.Minute)
+		for peer := range peers {
+			// Only include peers that have recently announced this file
+			if lastSeen, ok := t.peerLastSeen[peer]; ok && lastSeen.After(threshold) {
+				activePeers = append(activePeers, peer)
+			}
+		}
+	}
 	t.mu.Unlock()
 
-	// Always return a JSON response, even when there are no peers
+	// Always return a JSON response
 	w.Header().Set("Content-Type", "application/json")
 
-	if !exists || len(peers) == 0 {
-		log.Printf("No peers found for file %s", fileID)
-		// Return empty array instead of error
+	if len(activePeers) == 0 {
+		log.Printf("No active peers found for file %s", fileID)
 		json.NewEncoder(w).Encode([]string{})
 		return
 	}
 
-	// Convert the peer map to a list for easier JSON encoding
-	peerList := make([]string, 0, len(peers))
-	for peer := range peers {
-		peerList = append(peerList, peer)
-	}
-
-	log.Printf("Peers for file %s: %v", fileID, peerList)
-	if err := json.NewEncoder(w).Encode(peerList); err != nil {
+	log.Printf("Active peers for file %s: %v", fileID, activePeers)
+	if err := json.NewEncoder(w).Encode(activePeers); err != nil {
 		http.Error(w, "Failed to encode peer list", http.StatusInternalServerError)
 	}
 }
