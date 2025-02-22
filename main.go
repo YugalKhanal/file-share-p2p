@@ -32,6 +32,7 @@ func main() {
 		http.HandleFunc("/announce", tracker.HandleAnnounce)
 		http.HandleFunc("/peers", tracker.HandleGetPeers)
 		http.HandleFunc("/metadata", tracker.HandleGetMetadata)
+		http.HandleFunc("/remove", tracker.HandleRemove) // Add new handler
 
 		tracker.StartCleanupLoop()
 		log.Printf("Starting tracker on %s", *listenAddr)

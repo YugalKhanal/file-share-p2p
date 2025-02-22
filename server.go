@@ -578,51 +578,48 @@ func (s *FileServer) ShareFile(filePath string) error {
 	return nil
 }
 
-func (s *FileServer) StopSeedingFile(fileID string) {
+// In server.go
+func (s *FileServer) StopSeedingFile(fileID string) error {
 	s.activeFilesMu.Lock()
 	delete(s.activeFiles, fileID)
 	s.activeFilesMu.Unlock()
 
-	// Immediately notify tracker that we've stopped seeding
-	if s.opts.TrackerAddr != "" {
-		go func() {
-			peerAddr, err := getPeerAddress(s.opts.ListenAddr)
-			if err != nil {
-				log.Printf("Failed to get peer address: %v", err)
-				return
-			}
-
-			// Create heartbeat message with updated file list
-			s.activeFilesMu.RLock()
-			activeFileIDs := make([]string, 0, len(s.activeFiles))
-			for id := range s.activeFiles {
-				activeFileIDs = append(activeFileIDs, id)
-			}
-			s.activeFilesMu.RUnlock()
-
-			heartbeat := struct {
-				PeerAddr string   `json:"peer_addr"`
-				FileIDs  []string `json:"file_ids"`
-			}{
-				PeerAddr: peerAddr,
-				FileIDs:  activeFileIDs,
-			}
-
-			jsonData, err := json.Marshal(heartbeat)
-			if err != nil {
-				log.Printf("Failed to marshal heartbeat: %v", err)
-				return
-			}
-
-			url := fmt.Sprintf("%s/heartbeat", s.opts.TrackerAddr)
-			resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
-			if err != nil {
-				log.Printf("Failed to send heartbeat: %v", err)
-				return
-			}
-			resp.Body.Close()
-		}()
+	// Immediately notify tracker
+	if s.opts.TrackerAddr == "" {
+		return fmt.Errorf("no tracker address configured")
 	}
+
+	peerAddr, err := getPeerAddress(s.opts.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to get peer address: %v", err)
+	}
+
+	// Send removal notification to tracker
+	url := fmt.Sprintf("%s/remove", s.opts.TrackerAddr)
+	removal := struct {
+		FileID   string `json:"file_id"`
+		PeerAddr string `json:"peer_addr"`
+	}{
+		FileID:   fileID,
+		PeerAddr: peerAddr,
+	}
+
+	jsonData, err := json.Marshal(removal)
+	if err != nil {
+		return fmt.Errorf("failed to marshal removal data: %v", err)
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to notify tracker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("tracker returned error status: %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
 // Add this to server.go
@@ -674,10 +671,36 @@ func (s *FileServer) logPeerState() {
 func (s *FileServer) DownloadFile(fileID string) error {
 	log.Printf("Attempting to download file with ID: %s", fileID)
 
-	// Get metadata from tracker
-	meta, err := s.getMetadataFromTracker(fileID)
+	// First check if the file exists and is being shared
+	url := fmt.Sprintf("%s/metadata?file_id=%s", s.opts.TrackerAddr, fileID)
+	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Errorf("file not found: %s (error: %v)", fileID, err)
+		return fmt.Errorf("failed to connect to tracker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("file %s is not available for download", fileID)
+	}
+
+	var fileInfo p2p.FileInfo
+	if err := json.NewDecoder(resp.Body).Decode(&fileInfo); err != nil {
+		return fmt.Errorf("failed to decode file info: %v", err)
+	}
+
+	if fileInfo.NumPeers == 0 {
+		return fmt.Errorf("file %s exists but no peers are currently sharing it", fileID)
+	}
+
+	// Convert FileInfo to Metadata
+	meta := &shared.Metadata{
+		FileID:        fileInfo.FileID,
+		NumChunks:     fileInfo.NumChunks,
+		ChunkSize:     fileInfo.ChunkSize,
+		FileExtension: fileInfo.Extension,
+		ChunkHashes:   fileInfo.ChunkHashes,
+		TotalHash:     fileInfo.TotalHash,
+		TotalSize:     fileInfo.TotalSize,
 	}
 
 	// Save metadata locally
@@ -685,14 +708,8 @@ func (s *FileServer) DownloadFile(fileID string) error {
 		return fmt.Errorf("failed to save metadata locally: %v", err)
 	}
 
-	// First refresh of peers
 	if err := s.refreshPeers(fileID); err != nil {
-		return fmt.Errorf("no peers are currently sharing file %s", fileID)
-	}
-
-	// Second refresh of peers (keeping both as in original code)
-	if err := s.refreshPeers(fileID); err != nil {
-		return fmt.Errorf("no peers are currently sharing file %s", fileID)
+		return fmt.Errorf("failed to connect to peers: %v", err)
 	}
 
 	// Wait a bit for connections to establish
@@ -703,7 +720,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	peerCount := len(s.peers)
 	s.mu.RUnlock()
 	if peerCount == 0 {
-		return fmt.Errorf("unable to connect to any peers for file %s - the file exists but no seeders are reachable", fileID)
+		return fmt.Errorf("unable to connect to any peers sharing file %s", fileID)
 	}
 
 	// Initialize piece manager
@@ -725,10 +742,16 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %v", err)
 	}
-	defer outputFile.Close()
+	defer func() {
+		outputFile.Close()
+		// If download failed, remove the empty file
+		if fileInfo, err := os.Stat(outputFileName); err == nil && fileInfo.Size() == 0 {
+			os.Remove(outputFileName)
+		}
+	}()
 
 	// Create semaphore to limit concurrent downloads
-	const maxConcurrent = 10 // Increased from 5 to allow more parallel downloads
+	const maxConcurrent = 10
 	sem := make(chan struct{}, maxConcurrent)
 
 	// Create error channel with buffer for all pieces
@@ -793,10 +816,6 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	activeDownloads := make(map[int]bool)
 	var activeMutex sync.Mutex
 
-	// Track if we've received any successful chunk downloads
-	var receivedAnyChunks bool
-	var receivedChunksMutex sync.Mutex
-
 	// Main download loop
 	for !pieceManager.IsComplete() {
 		// Get available peers
@@ -810,17 +829,10 @@ func (s *FileServer) DownloadFile(fileID string) error {
 		if len(availablePeers) == 0 {
 			// No peers available, try to refresh peers
 			if err := s.refreshPeers(fileID); err != nil {
-				log.Printf("Failed to refresh peers: %v", err)
-				// Check if we never received any chunks
-				receivedChunksMutex.Lock()
-				if !receivedAnyChunks {
-					receivedChunksMutex.Unlock()
-					return fmt.Errorf("no active seeders found for file %s - the file exists but no one is currently sharing it", fileID)
-				}
-				receivedChunksMutex.Unlock()
-				time.Sleep(5 * time.Second)
-				continue
+				return fmt.Errorf("all peers disconnected and failed to find new peers")
 			}
+			time.Sleep(5 * time.Second)
+			continue
 		}
 
 		pieces := pieceManager.GetNextPieces(maxConcurrent)
@@ -868,21 +880,11 @@ func (s *FileServer) DownloadFile(fileID string) error {
 						progressMutex.Lock()
 						completedPieces++
 						progressMutex.Unlock()
-
-						// Mark that we've received at least one chunk
-						receivedChunksMutex.Lock()
-						receivedAnyChunks = true
-						receivedChunksMutex.Unlock()
 						return
 					}
 
-					if strings.Contains(err.Error(), "not being actively seeded") {
-						log.Printf("Peer %s is not actively seeding file %s",
-							peer.RemoteAddr(), fileID)
-					} else {
-						log.Printf("Failed to download piece %d from peer %s: %v",
-							p.Index, peer.RemoteAddr(), err)
-					}
+					log.Printf("Failed to download piece %d from peer %s: %v",
+						p.Index, peer.RemoteAddr(), err)
 
 					// Remove failed peer from piece manager
 					pieceManager.RemovePeer(peer.RemoteAddr().String())
@@ -901,13 +903,10 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	// Wait for all downloads to complete
 	wg.Wait()
 
-	// Final check to see if we got any chunks
-	receivedChunksMutex.Lock()
-	if !receivedAnyChunks {
-		receivedChunksMutex.Unlock()
-		return fmt.Errorf("download failed - no seeders are actively sharing file %s", fileID)
+	// Verify the download was successful
+	if !pieceManager.IsComplete() {
+		return fmt.Errorf("download incomplete - some pieces could not be retrieved")
 	}
-	receivedChunksMutex.Unlock()
 
 	return nil
 }

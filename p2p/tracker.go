@@ -277,6 +277,45 @@ func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// In tracker.go
+func (t *Tracker) HandleRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var removal struct {
+		FileID   string `json:"file_id"`
+		PeerAddr string `json:"peer_addr"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&removal); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Remove peer from file's peer list
+	if peers, exists := t.peerIndex[removal.FileID]; exists {
+		delete(peers, removal.PeerAddr)
+
+		// Update file info
+		if info, exists := t.fileIndex[removal.FileID]; exists {
+			info.NumPeers = len(peers)
+			// Remove file if no peers are sharing it
+			if info.NumPeers == 0 {
+				delete(t.fileIndex, removal.FileID)
+				delete(t.peerIndex, removal.FileID)
+				log.Printf("Removed file %s as it has no active peers", removal.FileID)
+			}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
 // CleanupConfig holds configuration for the cleanup process
 type CleanupConfig struct {
 	InactivityThreshold time.Duration
@@ -286,8 +325,8 @@ type CleanupConfig struct {
 // DefaultCleanupConfig returns the default cleanup configuration
 func DefaultCleanupConfig() CleanupConfig {
 	return CleanupConfig{
-		InactivityThreshold: 120 * time.Second,  // Reduced from 2 minutes
-		CleanupInterval:     15 * time.Second, // Reduced from 30 seconds
+		InactivityThreshold: 120 * time.Second, // Reduced from 2 minutes
+		CleanupInterval:     15 * time.Second,  // Reduced from 30 seconds
 	}
 }
 
