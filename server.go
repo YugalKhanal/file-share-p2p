@@ -737,7 +737,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	}
 	s.mu.RUnlock()
 
-	outputFileName := fmt.Sprintf("downloaded_%s.%s", fileID, strings.TrimPrefix(meta.FileExtension, "."))
+	outputFileName := fmt.Sprintf("downloaded_%s.%s", fileID, meta.FileExtension)
 	outputFile, err := os.Create(outputFileName)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %v", err)
@@ -1075,11 +1075,17 @@ func (s *FileServer) bootstrapNetwork() {
 }
 
 // announceToTracker sends a request to the tracker to announce this peer's file availability.
-// In server.go
 func announceToTracker(trackerAddr string, fileID string, listenAddr string, metadata *shared.Metadata) error {
 	peerAddr, err := getPeerAddress(listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to determine peer address: %v", err)
+	}
+
+	// Get the file extension from the original path
+	extension := filepath.Ext(metadata.OriginalPath)
+	if extension != "" {
+		// Remove the leading dot if it exists
+		extension = strings.TrimPrefix(extension, ".")
 	}
 
 	// Create announcement payload
@@ -1103,7 +1109,7 @@ func announceToTracker(trackerAddr string, fileID string, listenAddr string, met
 		Size:        metadata.TotalSize,
 		Description: "File shared via ForeverStore",
 		Categories:  []string{"misc"},
-		Extension:   metadata.FileExtension,
+		Extension:   extension,
 		NumChunks:   metadata.NumChunks,
 		ChunkSize:   metadata.ChunkSize,
 		ChunkHashes: metadata.ChunkHashes,
