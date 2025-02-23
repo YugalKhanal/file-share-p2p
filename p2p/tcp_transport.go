@@ -47,7 +47,10 @@ func (p *TCPPeer) Send(b []byte) error {
 		return nil // Heartbeat message
 	}
 
-	p.SetWriteDeadline(time.Now().Add(writeTimeout))
+	err := p.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err != nil {
+		return fmt.Errorf("failed to set write deadline: %v", err)
+	}
 
 	// Ensure message size is within limits
 	if len(b) > 17*1024*1024 { // 17MB (16MB chunk + 1MB overhead)

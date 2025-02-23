@@ -11,8 +11,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/anthdm/foreverstore/p2p"
@@ -189,56 +187,6 @@ func (s *Store) ReadChunk(filePath string, chunkIndex int) ([]byte, error) {
 	return chunk, nil
 }
 
-// ChunkAndStore divides a file into chunks, stores each chunk,
-// and saves metadata about the number of chunks and file ID.
-func (s *Store) ChunkAndStore(fileID, filePath string) (*shared.Metadata, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %v", err)
-	}
-	defer file.Close()
-
-	// Extract the file extension from the file path
-	fileExtension := filepath.Ext(filePath)
-
-	// Variable to track the number of chunks created
-	chunkIndex := 0
-
-	// Read and store chunks
-	for {
-		buf := make([]byte, ChunkSize)
-		n, err := file.Read(buf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read chunk: %v", err)
-		}
-
-		// Define the chunk file name based on the file ID and chunk index
-		chunkFileName := fmt.Sprintf("%s_chunk_%d", fileID, chunkIndex)
-		if _, err := s.writeChunk(fileID, chunkFileName, fileExtension, buf[:n]); err != nil {
-			return nil, fmt.Errorf("failed to write chunk: %v", err)
-		}
-		chunkIndex++
-	}
-
-	// Create metadata to store the file details
-	meta := &shared.Metadata{
-		FileID:        fileID,
-		NumChunks:     chunkIndex,
-		FileExtension: fileExtension,
-		ChunkSize:     ChunkSize,
-	}
-
-	// Save metadata as JSON in the store
-	if err := s.saveMetadata(meta); err != nil {
-		return nil, fmt.Errorf("failed to save metadata: %v", err)
-	}
-
-	return meta, nil
-}
-
 // saveMetadata saves metadata as a JSON file to the store directory
 func (s *Store) saveMetadata(meta *shared.Metadata) error {
 	// Create the directory if it doesn't exist
@@ -273,21 +221,4 @@ func (s *Store) GetMetadata(fileID string) (*shared.Metadata, error) {
 	}
 
 	return &metadata, nil
-}
-
-// writeChunk saves a chunk of data to a file in the store directory
-func (s *Store) writeChunk(id, name, ext string, data []byte) (int, error) {
-	dir := fmt.Sprintf("%s/%s", s.opts.Root, id)
-	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
-		return 0, err
-	}
-	// Make sure we only have one dot before the extension
-	name = strings.TrimSuffix(name, ".")
-	filePath := fmt.Sprintf("%s/%s%s", dir, name, ext)
-	f, err := os.Create(filePath)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	return f.Write(data)
 }

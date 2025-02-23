@@ -15,12 +15,6 @@ func calculateHash(data []byte) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-// verifyChunk checks if a chunk's hash matches the expected hash
-func verifyChunk(data []byte, expectedHash string) bool {
-	actualHash := calculateHash(data)
-	return actualHash == expectedHash
-}
-
 // generateFileHashes generates hashes for each chunk and the total file
 func generateFileHashes(filePath string, chunkSize int) ([]string, string, int64, error) {
 	file, err := os.Open(filePath)
