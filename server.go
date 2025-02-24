@@ -141,94 +141,9 @@ func getPeerAddress(listenAddr string) (string, error) {
 // }
 
 // New function to refresh peer list from tracker
+// Replace the existing refreshPeers function
 func (s *FileServer) refreshPeers(fileID string) error {
-	url := fmt.Sprintf("%s/peers?file_id=%s", s.opts.TrackerAddr, fileID)
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("failed to get peers from tracker: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("tracker returned error: %s", string(body))
-	}
-
-	var peerList []string
-	peerList = filterPeerList(peerList)
-	if err := json.NewDecoder(resp.Body).Decode(&peerList); err != nil {
-		return fmt.Errorf("failed to decode peer list: %v", err)
-	}
-
-	if len(peerList) == 0 {
-		return fmt.Errorf("no peers are currently sharing file %s", fileID)
-	}
-
-	log.Printf("Received peer list from tracker: %v", peerList)
-
-	// Create a wait group to track connection attempts
-	var wg sync.WaitGroup
-	successChan := make(chan bool, len(peerList))
-
-	myAddr := s.opts.ListenAddr
-	if strings.HasPrefix(myAddr, ":") {
-		myAddr = "localhost" + myAddr
-	}
-
-	// Try to connect to each peer
-	for _, peerAddr := range peerList {
-		addresses := strings.Split(peerAddr, "|")
-		for _, addr := range addresses {
-			if addr == myAddr {
-				log.Printf("Skipping own address: %s", addr)
-				continue
-			}
-
-			wg.Add(1)
-			go func(addr string) {
-				defer wg.Done()
-
-				log.Printf("Attempting to connect to peer: %s", addr)
-				if err := s.opts.Transport.Dial(addr); err != nil {
-					log.Printf("Failed to connect to peer %s: %v", addr, err)
-					return
-				}
-
-				// Wait briefly for the connection to be established
-				time.Sleep(time.Second)
-
-				s.mu.RLock()
-				_, connected := s.peers[addr]
-				s.mu.RUnlock()
-
-				if connected {
-					log.Printf("Successfully connected to peer: %s", addr)
-					successChan <- true
-				}
-			}(addr)
-		}
-	}
-
-	// Wait for all connection attempts
-	go func() {
-		wg.Wait()
-		close(successChan)
-	}()
-
-	// Wait for at least one successful connection
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-
-	select {
-	case _, ok := <-successChan:
-		if ok {
-			return nil
-		}
-	case <-timer.C:
-		return fmt.Errorf("timeout waiting for peer connections")
-	}
-
-	return fmt.Errorf("failed to establish any peer connections")
+	return s.connectToAllPeers(fileID)
 }
 
 func (s *FileServer) Start() error {
@@ -261,7 +176,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Get current list of peers and shuffle them
+		// Get current list of peers and shuffle them for load balancing
 		s.mu.RLock()
 		peers := make([]p2p.Peer, 0, len(s.peers))
 		for _, peer := range s.peers {
@@ -298,7 +213,6 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 
 			// Set up response handler
 			s.mu.Lock()
-			// handlerIndex := len(s.responseHandlers)
 			s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
 				select {
 				case <-done:
@@ -485,6 +399,104 @@ func (s *FileServer) listPeers() []string {
 	return peers
 }
 
+func (s *FileServer) connectToAllPeers(fileID string) error {
+	url := fmt.Sprintf("%s/peers?file_id=%s", s.opts.TrackerAddr, fileID)
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to get peers from tracker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("tracker returned error: %s", string(body))
+	}
+
+	var peerList []string
+	if err := json.NewDecoder(resp.Body).Decode(&peerList); err != nil {
+		return fmt.Errorf("failed to decode peer list: %v", err)
+	}
+
+	if len(peerList) == 0 {
+		return fmt.Errorf("no peers are currently sharing file %s", fileID)
+	}
+
+	// Filter peer list to avoid connecting to private IPs when not needed
+	peerList = filterPeerList(peerList)
+
+	log.Printf("Received %d peers from tracker", len(peerList))
+
+	// Create a wait group to track connection attempts
+	var wg sync.WaitGroup
+	connectionsMade := 0
+	var connectionsMutex sync.Mutex
+
+	// Get own address to avoid connecting to self
+	myAddr := s.opts.ListenAddr
+	if strings.HasPrefix(myAddr, ":") {
+		myAddr = "localhost" + myAddr
+	}
+
+	// Connect to each peer in parallel
+	for _, peerAddr := range peerList {
+		addresses := strings.Split(peerAddr, "|")
+		for _, addr := range addresses {
+			if addr == myAddr {
+				log.Printf("Skipping own address: %s", addr)
+				continue
+			}
+
+			// Check if we're already connected to this peer
+			s.mu.RLock()
+			_, alreadyConnected := s.peers[addr]
+			s.mu.RUnlock()
+
+			if alreadyConnected {
+				continue
+			}
+
+			wg.Add(1)
+			go func(addr string) {
+				defer wg.Done()
+
+				log.Printf("Attempting to connect to peer: %s", addr)
+				if err := s.opts.Transport.Dial(addr); err != nil {
+					log.Printf("Failed to connect to peer %s: %v", addr, err)
+					return
+				}
+
+				// Wait briefly for the connection to be established
+				time.Sleep(time.Second)
+
+				s.mu.RLock()
+				_, connected := s.peers[addr]
+				s.mu.RUnlock()
+
+				if connected {
+					log.Printf("Successfully connected to peer: %s", addr)
+					connectionsMutex.Lock()
+					connectionsMade++
+					connectionsMutex.Unlock()
+				}
+			}(addr)
+		}
+	}
+
+	// Wait for all connection attempts
+	wg.Wait()
+
+	connectionsMutex.Lock()
+	numConnections := connectionsMade
+	connectionsMutex.Unlock()
+
+	if numConnections == 0 {
+		return fmt.Errorf("failed to establish any peer connections")
+	}
+
+	log.Printf("Connected to %d peers for file %s", numConnections, fileID)
+	return nil
+}
+
 func (s *FileServer) onPeer(peer p2p.Peer) error {
 	// Get the original address
 	origAddr := peer.RemoteAddr().String()
@@ -578,6 +590,71 @@ func (s *FileServer) ShareFile(filePath string) error {
 	return nil
 }
 
+// In server.go
+func (s *FileServer) StopSeedingFile(fileID string) error {
+	s.activeFilesMu.Lock()
+	delete(s.activeFiles, fileID)
+	s.activeFilesMu.Unlock()
+
+	// Immediately notify tracker
+	if s.opts.TrackerAddr == "" {
+		return fmt.Errorf("no tracker address configured")
+	}
+
+	peerAddr, err := getPeerAddress(s.opts.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to get peer address: %v", err)
+	}
+
+	// Send removal notification to tracker
+	url := fmt.Sprintf("%s/remove", s.opts.TrackerAddr)
+	removal := struct {
+		FileID   string `json:"file_id"`
+		PeerAddr string `json:"peer_addr"`
+	}{
+		FileID:   fileID,
+		PeerAddr: peerAddr,
+	}
+
+	jsonData, err := json.Marshal(removal)
+	if err != nil {
+		return fmt.Errorf("failed to marshal removal data: %v", err)
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to notify tracker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("tracker returned error status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// Add this to server.go
+func (s *FileServer) Cleanup() {
+	log.Printf("Starting cleanup...")
+
+	// Get list of active files
+	s.activeFilesMu.RLock()
+	activeFiles := make([]string, 0, len(s.activeFiles))
+	for fileID := range s.activeFiles {
+		activeFiles = append(activeFiles, fileID)
+	}
+	s.activeFilesMu.RUnlock()
+
+	// Stop seeding each file
+	for _, fileID := range activeFiles {
+		s.StopSeedingFile(fileID)
+	}
+
+	// Close the quit channel
+	close(s.quitch)
+}
+
 func (s *FileServer) generateFileID(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -606,10 +683,36 @@ func (s *FileServer) logPeerState() {
 func (s *FileServer) DownloadFile(fileID string) error {
 	log.Printf("Attempting to download file with ID: %s", fileID)
 
-	// Get metadata from tracker
-	meta, err := s.getMetadataFromTracker(fileID)
+	// First check if the file exists and is being shared
+	url := fmt.Sprintf("%s/metadata?file_id=%s", s.opts.TrackerAddr, fileID)
+	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Errorf("failed to get metadata from tracker: %v", err)
+		return fmt.Errorf("failed to connect to tracker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("file %s is not available for download", fileID)
+	}
+
+	var fileInfo p2p.FileInfo
+	if err := json.NewDecoder(resp.Body).Decode(&fileInfo); err != nil {
+		return fmt.Errorf("failed to decode file info: %v", err)
+	}
+
+	if fileInfo.NumPeers == 0 {
+		return fmt.Errorf("file %s exists but no peers are currently sharing it", fileID)
+	}
+
+	// Convert FileInfo to Metadata
+	meta := &shared.Metadata{
+		FileID:        fileInfo.FileID,
+		NumChunks:     fileInfo.NumChunks,
+		ChunkSize:     fileInfo.ChunkSize,
+		FileExtension: fileInfo.Extension,
+		ChunkHashes:   fileInfo.ChunkHashes,
+		TotalHash:     fileInfo.TotalHash,
+		TotalSize:     fileInfo.TotalSize,
 	}
 
 	// Save metadata locally
@@ -617,16 +720,10 @@ func (s *FileServer) DownloadFile(fileID string) error {
 		return fmt.Errorf("failed to save metadata locally: %v", err)
 	}
 
-	if err := s.refreshPeers(fileID); err != nil {
-		return fmt.Errorf("failed to get peers from tracker: %v", err)
+	// Connect to all available peers, not just one
+	if err := s.connectToAllPeers(fileID); err != nil {
+		log.Printf("Warning: Could not connect to all peers: %v", err)
 	}
-
-	if err := s.refreshPeers(fileID); err != nil {
-		return fmt.Errorf("failed to get peers from tracker: %v", err)
-	}
-
-	// Wait a bit for connections to establish
-	time.Sleep(2 * time.Second)
 
 	// Initialize piece manager
 	pieceManager := NewPieceManager(meta.NumChunks, meta.ChunkHashes)
@@ -647,10 +744,16 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %v", err)
 	}
-	defer outputFile.Close()
+	defer func() {
+		outputFile.Close()
+		// If download failed, remove the empty file
+		if fileInfo, err := os.Stat(outputFileName); err == nil && fileInfo.Size() == 0 {
+			os.Remove(outputFileName)
+		}
+	}()
 
 	// Create semaphore to limit concurrent downloads
-	const maxConcurrent = 10 // Increased from 5 to allow more parallel downloads
+	const maxConcurrent = 10
 	sem := make(chan struct{}, maxConcurrent)
 
 	// Create error channel with buffer for all pieces
@@ -674,13 +777,13 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 	// Start periodic peer refresh in background
 	go func() {
-		refreshTicker := time.NewTicker(30 * time.Second)
+		refreshTicker := time.NewTicker(20 * time.Second)
 		defer refreshTicker.Stop()
 
 		for {
 			select {
 			case <-refreshTicker.C:
-				if err := s.refreshPeers(fileID); err != nil {
+				if err := s.connectToAllPeers(fileID); err != nil {
 					log.Printf("Failed to refresh peers: %v", err)
 				}
 			case <-done:
@@ -704,10 +807,15 @@ func (s *FileServer) DownloadFile(fileID string) error {
 			remainingPieces := meta.NumChunks - currentCompleted
 			eta := float64(remainingPieces) / piecesPerSecond
 
-			log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds",
+			// Also log the number of connected peers
+			s.mu.RLock()
+			numPeers := len(s.peers)
+			s.mu.RUnlock()
+
+			log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds - Connected peers: %d",
 				currentCompleted, meta.NumChunks,
 				float64(currentCompleted)/float64(meta.NumChunks)*100,
-				piecesPerSecond, eta)
+				piecesPerSecond, eta, numPeers)
 		}
 	}()
 
@@ -719,30 +827,34 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	for !pieceManager.IsComplete() {
 		// Get available peers
 		s.mu.RLock()
-		availablePeers := make([]p2p.Peer, 0, len(s.peers))
-		for _, peer := range s.peers {
-			availablePeers = append(availablePeers, peer)
-		}
+		peerCount := len(s.peers)
 		s.mu.RUnlock()
 
-		if len(availablePeers) == 0 {
+		if peerCount == 0 {
 			// No peers available, try to refresh peers
-			if err := s.refreshPeers(fileID); err != nil {
-				log.Printf("Failed to refresh peers: %v", err)
-				time.Sleep(5 * time.Second)
-				continue
+			if err := s.connectToAllPeers(fileID); err != nil {
+				return fmt.Errorf("all peers disconnected and failed to find new peers")
 			}
+			time.Sleep(5 * time.Second)
+			continue
 		}
 
-		pieces := pieceManager.GetNextPieces(maxConcurrent)
+		// Request more pieces than we have workers to keep the pipeline full
+		requestMultiple := 2
+		if peerCount > 1 {
+			requestMultiple = peerCount * 2
+		}
+		pieces := pieceManager.GetNextPieces(maxConcurrent * requestMultiple)
+
 		if len(pieces) == 0 {
 			// Check if we have any active downloads before breaking
 			activeMutex.Lock()
-			if len(activeDownloads) == 0 {
-				activeMutex.Unlock()
+			activeCount := len(activeDownloads)
+			activeMutex.Unlock()
+
+			if activeCount == 0 {
 				break
 			}
-			activeMutex.Unlock()
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -765,34 +877,20 @@ func (s *FileServer) DownloadFile(fileID string) error {
 					activeMutex.Unlock()
 				}()
 
-				// Try each peer until successful
-				for _, peer := range availablePeers {
-					select {
-					case <-done:
-						return
-					default:
-					}
-
-					err := s.downloadChunk(fileID, p.Index, meta.ChunkSize, outputFile)
-					if err == nil {
-						pieceManager.MarkPieceStatus(p.Index, PieceVerified)
-						progressMutex.Lock()
-						completedPieces++
-						progressMutex.Unlock()
-						return
-					}
-
-					log.Printf("Failed to download piece %d from peer %s: %v",
-						p.Index, peer.RemoteAddr(), err)
-
-					// Remove failed peer from piece manager
-					pieceManager.RemovePeer(peer.RemoteAddr().String())
+				// Download the chunk
+				err := s.downloadChunk(fileID, p.Index, meta.ChunkSize, outputFile)
+				if err == nil {
+					pieceManager.MarkPieceStatus(p.Index, PieceVerified)
+					progressMutex.Lock()
+					completedPieces++
+					progressMutex.Unlock()
+					return
 				}
 
-				// All peers failed for this piece
+				log.Printf("Failed to download piece %d: %v", p.Index, err)
 				pieceManager.MarkPieceStatus(p.Index, PieceMissing)
 				select {
-				case errorChan <- fmt.Errorf("failed to download piece %d from any peer", p.Index):
+				case errorChan <- fmt.Errorf("failed to download piece %d: %v", p.Index, err):
 				default:
 				}
 			}(piece)
@@ -801,6 +899,11 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 	// Wait for all downloads to complete
 	wg.Wait()
+
+	// Verify the download was successful
+	if !pieceManager.IsComplete() {
+		return fmt.Errorf("download incomplete - some pieces could not be retrieved")
+	}
 
 	return nil
 }

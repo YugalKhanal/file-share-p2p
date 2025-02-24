@@ -73,6 +73,15 @@ func NewStore(opts StoreOpts) *Store {
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
 	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
 
+	// First check if we're actively seeding this file
+	s.activeFilesMu.RLock()
+	_, isActive := s.activeFiles[req.FileID]
+	s.activeFilesMu.RUnlock()
+
+	if !isActive {
+		return fmt.Errorf("file %s is not being actively seeded", req.FileID)
+	}
+
 	// Add flow control - check if we're already sending too many chunks
 	const maxConcurrentChunks = 5
 	s.mu.Lock()
@@ -82,22 +91,10 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return fmt.Errorf("too many active chunk transfers")
 	}
 
-	// Validate and get metadata
+	// Get metadata for the file
 	s.activeFilesMu.RLock()
-	activeMeta, isActive := s.activeFiles[req.FileID]
+	meta := s.activeFiles[req.FileID]
 	s.activeFilesMu.RUnlock()
-
-	var meta *shared.Metadata
-	var err error
-	if isActive {
-		meta = activeMeta
-	} else {
-		meta, err = s.store.GetMetadata(req.FileID)
-		if err != nil {
-			log.Printf("Error getting metadata: %v", err)
-			return fmt.Errorf("file metadata not found: %v", err)
-		}
-	}
 
 	if req.Chunk >= meta.NumChunks {
 		return fmt.Errorf("invalid chunk index %d, file only has %d chunks",
@@ -106,6 +103,7 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 
 	// Read chunk with retry logic
 	var chunkData []byte
+	var err error
 	for retries := 0; retries < 3; retries++ {
 		chunkData, err = s.store.ReadChunk(meta.OriginalPath, req.Chunk)
 		if err == nil {
