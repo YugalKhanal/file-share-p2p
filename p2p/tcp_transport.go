@@ -2,11 +2,11 @@ package p2p
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,19 +77,22 @@ type TCPTransportOpts struct {
 	OnPeer        func(Peer) error
 }
 
+// In tcp_transport.go
+
 type TCPTransport struct {
 	TCPTransportOpts
-	listener   net.Listener
-	rpcch      chan RPC
-	bufferSize int //adding buffer size for large downloads
+	listener    net.Listener
+	udpConn     *net.UDPConn
+	rpcch       chan RPC
+	punchingMap sync.Map
+	connectedCh chan string
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
 	return &TCPTransport{
 		TCPTransportOpts: opts,
-		// 1024 -> 4096, increased channel buffer to handle more concurrent messages for larger file transfers
-		rpcch:      make(chan RPC, 16384),
-		bufferSize: 128 * 1024 * 1024, //n-MB buffersize
+		rpcch:            make(chan RPC, 1024),
+		connectedCh:      make(chan string, 1),
 	}
 }
 
@@ -116,40 +119,122 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return err
+	if t.udpConn == nil {
+		log.Printf("Initializing UDP listener for hole punching")
+		if err := t.setupUDPListener(); err != nil {
+			return fmt.Errorf("UDP setup failed: %v", err)
+		}
 	}
 
-	go t.handleConn(conn, true)
+	addrs := strings.Split(addr, "|")
+	log.Printf("Attempting to connect to addresses: %v", addrs)
 
-	return nil
+	errCh := make(chan error, len(addrs))
+	doneCh := make(chan struct{})
+
+	for _, address := range addrs {
+		go func(targetAddr string) {
+			host, portStr, err := net.SplitHostPort(targetAddr)
+			if err != nil {
+				errCh <- fmt.Errorf("invalid address %s: %v", targetAddr, err)
+				return
+			}
+
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				errCh <- fmt.Errorf("invalid port in address %s: %v", targetAddr, err)
+				return
+			}
+
+			// Create UDP address using the same port as the TCP service
+			udpAddr := &net.UDPAddr{
+				IP:   net.ParseIP(host),
+				Port: port, // Use the port from the target address
+			}
+
+			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
+			log.Printf("Starting hole punching to %s (UDP: %s)", targetAddr, udpAddr)
+
+			// Send punch messages with exponential backoff
+			for i := 0; i < 5; i++ {
+				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+				if err != nil {
+					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
+				} else {
+					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
+				}
+
+				// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+				backoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
+				time.Sleep(backoff)
+			}
+
+			// Try direct TCP connection as fallback
+			log.Printf("Attempting direct TCP connection to %s", targetAddr)
+			if conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second); err == nil {
+				log.Printf("Direct TCP connection successful to %s", targetAddr)
+				go t.handleConn(conn, true)
+				close(doneCh)
+				return
+			} else {
+				log.Printf("Direct TCP connection failed to %s: %v", targetAddr, err)
+			}
+		}(address)
+	}
+
+	// Wait longer for hole punching to work
+	log.Printf("Waiting for connection success or timeout")
+	select {
+	case <-doneCh:
+		log.Printf("Connection established via direct TCP")
+		return nil
+	case <-t.connectedCh:
+		log.Printf("Connection established via hole punching")
+		return nil
+	case err := <-errCh:
+		log.Printf("Connection error: %v", err)
+		return err
+	case <-time.After(20 * time.Second): // Increased timeout
+		log.Printf("Connection attempt timed out")
+		return fmt.Errorf("connection timeout")
+	}
+}
+
+func (t *TCPTransport) getPort() int {
+	parts := strings.Split(t.ListenAddr, ":")
+	if len(parts) != 2 {
+		return 0
+	}
+	port, _ := strconv.Atoi(parts[1])
+	return port
 }
 
 func (t *TCPTransport) ListenAndAccept() error {
 	var err error
-
 	t.listener, err = net.Listen("tcp", t.ListenAddr)
 	if err != nil {
 		return err
 	}
 
+	// Setup UDP listener
+	if err := t.setupUDPListener(); err != nil {
+		t.listener.Close()
+		return err
+	}
+
 	go t.startAcceptLoop()
-
-	log.Printf("TCP transport listening on port: %s\n", t.ListenAddr)
-
 	return nil
 }
 
 func (t *TCPTransport) startAcceptLoop() {
 	for {
 		conn, err := t.listener.Accept()
-		if errors.Is(err, net.ErrClosed) {
-			return
-		}
-
 		if err != nil {
-			fmt.Printf("TCP accept error: %s\n", err)
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+			log.Printf("Accept error: %v", err)
+			continue
 		}
 
 		go t.handleConn(conn, false)
@@ -276,5 +361,3 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 
 	close(heartbeatCh)
 }
-
-// Update the Send method in TCPPeer

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math/rand"
 	"sort"
 	"sync"
 )
@@ -23,6 +24,7 @@ type PieceInfo struct {
 	Priority int             // higher number = higher priority
 }
 
+// PieceManager Keeps track of which peers are availalble for each piece
 type PieceManager struct {
 	pieces    map[int]*PieceInfo
 	numPieces int
@@ -79,6 +81,8 @@ func (pm *PieceManager) RemovePeer(peerAddr string) {
 }
 
 // GetNextPieces returns the next n pieces to download, prioritizing rarest pieces
+// GetNextPieces returns the next n pieces to download, prioritizing rarest pieces
+// and distributing load across peers
 func (pm *PieceManager) GetNextPieces(n int) []PieceInfo {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -91,9 +95,23 @@ func (pm *PieceManager) GetNextPieces(n int) []PieceInfo {
 		}
 	}
 
-	// Sort by priority (rarest first)
+	// If no candidates, try to include requested pieces that might have timed out
+	if len(candidates) == 0 {
+		for _, piece := range pm.pieces {
+			if piece.Status == PieceRequested && len(piece.Peers) > 0 {
+				candidates = append(candidates, *piece)
+			}
+		}
+	}
+
+	// Sort by priority (rarest first) and add some randomness to avoid all clients
+	// requesting the same pieces simultaneously
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Priority > candidates[j].Priority
+		// 80% of the time use priority, 20% of the time use random order
+		if rand.Float32() < 0.8 {
+			return candidates[i].Priority > candidates[j].Priority
+		}
+		return rand.Intn(2) == 0
 	})
 
 	// Return up to n pieces

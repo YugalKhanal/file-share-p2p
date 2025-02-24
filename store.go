@@ -18,7 +18,6 @@ import (
 	"github.com/anthdm/foreverstore/shared"
 )
 
-// const ChunkSize = 1024 * 1024
 const ChunkSize = 1024 * 1024 * 16 // 16MB chunks instead of 1MB
 
 type Metadata struct {
@@ -73,17 +72,30 @@ func NewStore(opts StoreOpts) *Store {
 func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkRequest) error {
 	log.Printf("Processing chunk request for file %s chunk %d", req.FileID, req.Chunk)
 
-	// First verify that we are actually seeding this file
+	// First check if we're actively seeding this file
 	s.activeFilesMu.RLock()
-	metadata, isSeeding := s.activeFiles[req.FileID]
+	_, isActive := s.activeFiles[req.FileID]
 	s.activeFilesMu.RUnlock()
 
-	if !isSeeding {
-		return fmt.Errorf("not seeding file %s", req.FileID)
+	if !isActive {
+		return fmt.Errorf("file %s is not being actively seeded", req.FileID)
 	}
 
-	// Validate chunk index
-	if req.Chunk >= metadata.NumChunks {
+	// Add flow control - check if we're already sending too many chunks
+	const maxConcurrentChunks = 5
+	s.mu.Lock()
+	activeSends := len(s.responseHandlers)
+	s.mu.Unlock()
+	if activeSends >= maxConcurrentChunks {
+		return fmt.Errorf("too many active chunk transfers")
+	}
+
+	// Get metadata for the file
+	s.activeFilesMu.RLock()
+	meta := s.activeFiles[req.FileID]
+	s.activeFilesMu.RUnlock()
+
+	if req.Chunk >= meta.NumChunks {
 		return fmt.Errorf("invalid chunk index %d, file only has %d chunks",
 			req.Chunk, metadata.NumChunks)
 	}
