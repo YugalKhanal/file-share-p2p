@@ -132,16 +132,6 @@ func getPeerAddress(listenAddr string) (string, error) {
 	return fmt.Sprintf("%s:%s|%s:%s", publicIP, port, localIP, port), nil
 }
 
-// func getPeerAddress(port string) (string, error) {
-// 	// For local development, always use localhost
-// 	if strings.HasPrefix(port, ":") {
-// 		port = port[1:]
-// 	}
-// 	return fmt.Sprintf("localhost:%s", port), nil
-// }
-
-// New function to refresh peer list from tracker
-// Replace the existing refreshPeers function
 func (s *FileServer) refreshPeers(fileID string) error {
 	return s.connectToAllPeers(fileID)
 }
@@ -344,7 +334,7 @@ func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int
 	return fmt.Errorf("failed to write chunk after retries")
 }
 
-// New method to handle RPC messages
+// Handle RPC messages
 func (s *FileServer) handleRPCMessage(rpc p2p.RPC) error {
 	// Decode the basic message structure
 	var msg p2p.Message
@@ -386,17 +376,6 @@ func (s *FileServer) handleRPCMessage(rpc p2p.RPC) error {
 	default:
 		return fmt.Errorf("unknown message type: %s", msg.Type)
 	}
-}
-
-// Add a helper method to list current peers (for debugging)
-func (s *FileServer) listPeers() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	peers := make([]string, 0, len(s.peers))
-	for addr := range s.peers {
-		peers = append(peers, addr)
-	}
-	return peers
 }
 
 func (s *FileServer) connectToAllPeers(fileID string) error {
@@ -634,7 +613,6 @@ func (s *FileServer) StopSeedingFile(fileID string) error {
 	return nil
 }
 
-// Add this to server.go
 func (s *FileServer) Cleanup() {
 	log.Printf("Starting cleanup...")
 
@@ -976,8 +954,6 @@ func (s *FileServer) handleMetadataRequest(peer p2p.Peer, req p2p.MessageMetadat
 	return nil
 }
 
-// In server.go, add this new function
-// In server.go
 func (s *FileServer) getMetadataFromTracker(fileID string) (*shared.Metadata, error) {
 	url := fmt.Sprintf("%s/metadata?file_id=%s", s.opts.TrackerAddr, fileID)
 	resp, err := http.Get(url)
@@ -1072,7 +1048,6 @@ func (s *FileServer) bootstrapNetwork() {
 }
 
 // announceToTracker sends a request to the tracker to announce this peer's file availability.
-// In server.go
 func announceToTracker(trackerAddr string, fileID string, listenAddr string, metadata *shared.Metadata) error {
 	peerAddr, err := getPeerAddress(listenAddr)
 	if err != nil {
