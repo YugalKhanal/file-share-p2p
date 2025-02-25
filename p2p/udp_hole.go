@@ -37,84 +37,49 @@ func (t *TCPTransport) handleUDPMessages() {
 			log.Printf("UDP read error: %v", err)
 			continue
 		}
+
 		message := string(buf[:n])
 		log.Printf("Received UDP message from %s: %s", remoteAddr, message)
 
-		parts := strings.Split(message, ":")
-		if len(parts) != 2 {
-			log.Printf("Invalid message format (expected 2 parts separated by colon): %s", message)
-
-			// Try to extract the remote port for a response
-			if strings.HasPrefix(message, "PUNCH:") {
-				// Special handling for potentially malformed PUNCH messages
-				remoteParts := strings.Split(message, "PUNCH:")
-				if len(remoteParts) > 1 && remoteParts[1] != "" {
-					// Try to parse a port from the message
-					portStr := ""
-					if strings.Contains(remoteParts[1], ":") {
-						hostPort := strings.Split(remoteParts[1], ":")
-						if len(hostPort) > 1 {
-							portStr = hostPort[len(hostPort)-1]
-						}
-					} else {
-						// The message might just contain the port number
-						portStr = remoteParts[1]
-					}
-
-					if portStr != "" {
-						port, err := strconv.Atoi(portStr)
-						if err == nil {
-							// Send acknowledgment using the extracted port
-							ackAddr := &net.UDPAddr{
-								IP:   remoteAddr.IP,
-								Port: port,
-							}
-							ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
-							_, err = t.udpConn.WriteToUDP([]byte(ackMsg), ackAddr)
-							if err != nil {
-								log.Printf("Failed to send ACK to %s: %v", ackAddr, err)
-							} else {
-								log.Printf("Sent ACK to %s (recovered from malformed message)", ackAddr)
-							}
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		messageType, tcpAddr := parts[0], parts[1]
-		switch messageType {
-		case "PUNCH":
+		// Use a more flexible parsing approach, not just simple split
+		if strings.HasPrefix(message, "PUNCH:") {
+			// Extract the TCP address from the PUNCH message
+			tcpAddr := strings.TrimPrefix(message, "PUNCH:")
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
-			// Check if tcpAddr is valid
+
+			// Extract port from the address
+			var punchPort int
+
 			if tcpAddr == "" {
 				log.Printf("Empty TCP address in punch message")
 				continue
 			}
-			// Extract port from punch message address
+
+			// Try to extract port from address
 			_, portStr, err := net.SplitHostPort(tcpAddr)
 			if err != nil {
-				log.Printf("Invalid TCP address in punch message: %v", err)
-
-				// Try to use the source port as a fallback
-				portStr = strconv.Itoa(remoteAddr.Port)
-				log.Printf("Using source port as fallback: %s", portStr)
+				log.Printf("Invalid TCP address format in punch message: %v", err)
+				// Fallback to using the remote port
+				punchPort = remoteAddr.Port
+				log.Printf("Using source port as fallback: %d", punchPort)
+			} else {
+				punchPort, err = strconv.Atoi(portStr)
+				if err != nil {
+					log.Printf("Invalid port in punch message: %v", err)
+					continue
+				}
 			}
 
-			punchPort, err := strconv.Atoi(portStr)
-			if err != nil {
-				log.Printf("Invalid port in punch message: %v", err)
-				continue
-			}
-
-			// Send acknowledgment using the port from the message or fallback
+			// Send acknowledgment using the determined port
 			ackAddr := &net.UDPAddr{
 				IP:   remoteAddr.IP,
 				Port: punchPort,
 			}
 
+			// Format the ACK message correctly
 			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
+			log.Printf("Sending ACK message: %s to %s", ackMsg, ackAddr)
+
 			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), ackAddr)
 			if err != nil {
 				log.Printf("Failed to send ACK to %s: %v", ackAddr, err)
@@ -126,8 +91,8 @@ func (t *TCPTransport) handleUDPMessages() {
 			go func() {
 				time.Sleep(100 * time.Millisecond)
 
-				// Create a TCP address for connection attempt
-				tcpTargetAddr := fmt.Sprintf("%s:%d", remoteAddr.IP.String(), punchPort)
+				// Create a TCP address for connection attempt - Using formatTCPAddress here
+				tcpTargetAddr := formatTCPAddress(remoteAddr.IP, punchPort)
 				log.Printf("Attempting TCP connection to %s", tcpTargetAddr)
 
 				if conn, err := net.DialTimeout("tcp", tcpTargetAddr, 5*time.Second); err == nil {
@@ -138,14 +103,19 @@ func (t *TCPTransport) handleUDPMessages() {
 				}
 			}()
 
-		case "ACK":
+		} else if strings.HasPrefix(message, "ACK:") {
+			// Extract the TCP address from the ACK message
+			tcpAddr := strings.TrimPrefix(message, "ACK:")
 			log.Printf("Received ACK from %s for TCP address %s", remoteAddr, tcpAddr)
+
 			select {
 			case t.connectedCh <- tcpAddr:
 				log.Printf("Notified of successful connection to %s", tcpAddr)
 			default:
 				log.Printf("Failed to notify of connection to %s (channel full)", tcpAddr)
 			}
+		} else {
+			log.Printf("Received unknown message type: %s", message)
 		}
 	}
 }
