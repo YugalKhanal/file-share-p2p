@@ -396,6 +396,8 @@ func (t *UDPTransport) handleUDPDataRequest(remoteAddr *net.UDPAddr, fileID stri
 			return
 		}
 
+		// Instead of sending the header and data separately, combine them in a single message
+		// with a distinctive marker between header and data
 		// Format: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<dataLength>||<actual data>
 		// The "||" acts as a delimiter that won't likely appear in metadata
 		headerStr := fmt.Sprintf("DATA_RESP:%s:%s:%d:%d||",
@@ -429,7 +431,6 @@ func (t *UDPTransport) handleUDPMessages() {
 
 	// Track expected data messages
 	expectingData := make(map[string]bool)
-	// dataBuffers := make(map[string][]byte)
 	var dataBuffersMu sync.Mutex
 
 	for {
@@ -453,7 +454,7 @@ func (t *UDPTransport) handleUDPMessages() {
 
 		// Handle different message types
 		if strings.HasPrefix(message, "PUNCH:") {
-			// Handle PUNCH messages (existing code)
+			// Handle PUNCH messages
 			parts := strings.SplitN(message, ":", 2)
 			if len(parts) != 2 {
 				log.Printf("Invalid PUNCH format from %s: %s", remoteAddr, message)
@@ -479,7 +480,7 @@ func (t *UDPTransport) handleUDPMessages() {
 			}
 
 		} else if strings.HasPrefix(message, "ACK:") {
-			// Handle ACK messages (existing code)
+			// Handle ACK messages
 			parts := strings.SplitN(message, ":", 2)
 			if len(parts) != 2 {
 				log.Printf("Invalid ACK format from %s: %s", remoteAddr, message)
@@ -498,6 +499,28 @@ func (t *UDPTransport) handleUDPMessages() {
 
 			// Store this peer for future UDP communication
 			t.udpPeers.Store(remoteAddr.String(), remoteAddr)
+
+		} else if strings.HasPrefix(message, "DATA_REQ:") {
+			// Handle data request: DATA_REQ:<requestID>:<fileID>:<chunkIndex>
+			parts := strings.Split(strings.TrimPrefix(message, "DATA_REQ:"), ":")
+			if len(parts) != 3 {
+				log.Printf("Invalid DATA_REQ format from %s: %s", remoteAddr, message)
+				continue
+			}
+
+			requestID := parts[0]
+			fileID := parts[1]
+			chunkIndex, err := strconv.Atoi(parts[2])
+			if err != nil {
+				log.Printf("Invalid chunk index in DATA_REQ from %s: %s", remoteAddr, parts[2])
+				continue
+			}
+
+			log.Printf("Received UDP data request for file %s chunk %d from %s (requestID: %s)",
+				fileID, chunkIndex, remoteAddr, requestID)
+
+			// Process request in a separate goroutine
+			go t.handleUDPDataRequest(remoteAddr, fileID, chunkIndex, requestID)
 
 		} else if strings.HasPrefix(message, "DATA_RESP:") {
 			// Find the delimiter between header and data
@@ -525,7 +548,7 @@ func (t *UDPTransport) handleUDPMessages() {
 
 			dataLength, err := strconv.Atoi(parts[3])
 			if err != nil {
-				log.Printf("Invalid data length in DATA_RESP from %s: %v", remoteAddr, dataLength)
+				log.Printf("Invalid data length in DATA_RESP from %s: %v, %s", remoteAddr, dataLength, parts[3])
 				continue
 			}
 
@@ -558,76 +581,6 @@ func (t *UDPTransport) handleUDPMessages() {
 			} else {
 				log.Printf("Invalid handler type for UDP response with ID %s", requestID)
 			}
-		} else if strings.HasPrefix(message, "DATA_RESP:") {
-			// Handle data response header: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<dataLength>
-			parts := strings.Split(strings.TrimPrefix(message, "DATA_RESP:"), ":")
-			if len(parts) != 4 {
-				log.Printf("Invalid DATA_RESP header from %s: %s", remoteAddr, message)
-				continue
-			}
-
-			requestID := parts[0]
-			fileID := parts[1]
-			chunkIndex, err := strconv.Atoi(parts[2])
-			if err != nil {
-				log.Printf("Invalid chunk index in DATA_RESP from %s: %s", remoteAddr, parts[2])
-				continue
-			}
-
-			dataLength, err := strconv.Atoi(parts[3])
-			if err != nil {
-				log.Printf("Invalid data length in DATA_RESP from %s: %s", remoteAddr, parts[3])
-				continue
-			}
-
-			log.Printf("Received UDP data header for file %s chunk %d from %s (expected length: %d bytes)",
-				fileID, chunkIndex, remoteAddr, dataLength)
-
-			// Mark that we're expecting data for this request
-			dataBuffersMu.Lock()
-			expectingData[requestID] = true
-			dataBuffersMu.Unlock()
-
-		} else if len(expectingData) > 0 && !strings.Contains(message, ":") {
-			// This might be raw chunk data (payload following a DATA_RESP header)
-			dataBuffersMu.Lock()
-
-			// Try to match this data with pending requests
-			var matchedRequestID string
-
-			for reqID := range expectingData {
-				// Just take the first waiting request - this is a simplification
-				matchedRequestID = reqID
-				break
-			}
-
-			if matchedRequestID != "" {
-				// Store this data
-				delete(expectingData, matchedRequestID)
-
-				// Find the handler for this response
-				handlerObj, exists := t.udpResponseHandlers.Load(matchedRequestID)
-				if exists {
-					if handler, ok := handlerObj.(func([]byte, error)); ok {
-						// Call the handler with the data (on a new goroutine to avoid blocking)
-						go handler(data, nil)
-
-						// Clean up after successful response
-						t.udpResponseHandlers.Delete(matchedRequestID)
-						t.udpRequestsMu.Lock()
-						delete(t.udpRequests, matchedRequestID)
-						t.udpRequestsMu.Unlock()
-
-						log.Printf("Processed raw data packet (%d bytes) for request %s",
-							len(data), matchedRequestID)
-					}
-				}
-			} else {
-				log.Printf("Received unmatched data packet (%d bytes)", len(data))
-			}
-
-			dataBuffersMu.Unlock()
-
 		} else if strings.HasPrefix(message, "DATA_ERR:") {
 			// Handle error response: DATA_ERR:<requestID>:<fileID>:<chunkIndex>:<error message>
 			parts := strings.SplitN(strings.TrimPrefix(message, "DATA_ERR:"), ":", 4)
