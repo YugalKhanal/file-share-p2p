@@ -111,8 +111,6 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 		return nil, fmt.Errorf("file %s is not being actively seeded", fileID)
 	}
 
-	log.Printf("File is actively being seeded, metadata: %+v", meta)
-
 	if chunkIndex >= meta.NumChunks {
 		return nil, fmt.Errorf("invalid chunk index %d, file only has %d chunks",
 			chunkIndex, meta.NumChunks)
@@ -121,7 +119,7 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 	// Read chunk with retry logic
 	var chunkData []byte
 	var err error
-	for retries := 0; retries < 3; retries++ {
+	for retries := range 3 {
 		log.Printf("Reading chunk %d from file %s (attempt %d/3)",
 			chunkIndex, meta.OriginalPath, retries+1)
 
