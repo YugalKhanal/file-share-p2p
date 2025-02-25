@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthdm/foreverstore/shared"
 )
 
 // TCPPeer represents the remote node over a TCP established connection.
@@ -95,10 +97,10 @@ type TCPTransport struct {
 type UDPDataPacket struct {
 	From       *net.UDPAddr
 	FileID     string
-	ChunkIndex int
+	ChunkIndex int // This should match what's used in the handleUDPDataResponse method
 	Data       []byte
-	RequestID  string    // To match responses with requests
-	Timestamp  time.Time // For tracking timeouts
+	RequestID  string
+	Timestamp  time.Time
 }
 
 type UDPRequest struct {
@@ -186,12 +188,24 @@ func (t *TCPTransport) Dial(addr string) error {
 			}
 
 			// Ensure the listen address is properly formatted with a host
-			listenHost := "localhost"
 			listenPort := t.getPort()
-			listenAddr := fmt.Sprintf("%s:%d", listenHost, listenPort)
 
 			// Create a properly formatted PUNCH message
-			punchMsg := fmt.Sprintf("PUNCH:%s", listenAddr)
+			publicIP, err := shared.GetPublicIP()
+			if err != nil {
+				log.Printf("Warning: Failed to get public IP: %v", err)
+				// Fallback to local IP if public can't be determined
+				publicIP, err = shared.GetLocalIP()
+				if err != nil {
+					log.Printf("cannot determine IP address: %v", err)
+					return
+				}
+			}
+
+			// Create a PUNCH message with the public IP
+			punchMsg := fmt.Sprintf("PUNCH:%s:%d", publicIP, listenPort)
+			log.Printf("Starting hole punching to %s (UDP: %s) with message: %s",
+				targetAddr, udpAddr, punchMsg)
 			log.Printf("Starting hole punching to %s (UDP: %s) with message: %s",
 				targetAddr, udpAddr, punchMsg)
 

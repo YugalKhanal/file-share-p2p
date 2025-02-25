@@ -129,6 +129,44 @@ func (t *TCPTransport) setupUDPListener() error {
 	return nil
 }
 
+// Setup UDP data channel for file transfer
+func (t *TCPTransport) setupUDPDataChannel(remoteAddr *net.UDPAddr) {
+	log.Printf("UDP data channel established with %s", remoteAddr)
+
+	// Notify our FileServer that this peer is available via UDP
+	// (This would require extending the FileServer to handle UDP peers)
+	if t.OnUDPPeer != nil {
+		t.OnUDPPeer(remoteAddr.String())
+	}
+}
+
+// Handle UDP data request
+func (t *TCPTransport) handleUDPDataRequest(remoteAddr *net.UDPAddr, fileID string, chunkIndex int) {
+	// This would be implemented to fetch the chunk data and send it back via UDP
+	log.Printf("Received UDP data request for file %s chunk %d from %s",
+		fileID, chunkIndex, remoteAddr)
+
+	// Fetch chunk data (this would be implemented by FileServer)
+	// For now, just simulate with placeholder data
+	chunkData := []byte("PLACEHOLDER DATA CHUNK")
+
+	// Send the data response
+	dataResp := fmt.Sprintf("DATA_RESP:%s:%s:%d:", "request123", fileID, chunkIndex)
+
+	// First send the header
+	_, err := t.udpConn.WriteToUDP([]byte(dataResp), remoteAddr)
+	if err != nil {
+		log.Printf("Failed to send UDP data response header: %v", err)
+		return
+	}
+
+	// Then send the data
+	_, err = t.udpConn.WriteToUDP(chunkData, remoteAddr)
+	if err != nil {
+		log.Printf("Failed to send UDP data response: %v", err)
+	}
+}
+
 func (t *TCPTransport) handleUDPMessages() {
 	log.Printf("Starting UDP message handler")
 	buf := make([]byte, 64*1024) // Large buffer for data chunks
@@ -143,9 +181,42 @@ func (t *TCPTransport) handleUDPMessages() {
 
 		// Handle different message types
 		if strings.HasPrefix(message, "PUNCH:") {
-			// Handle PUNCH messages (existing code)
+			// Extract the sender's address
+			senderAddr := strings.TrimPrefix(message, "PUNCH:")
+			log.Printf("Received PUNCH message from %s, sending ACK to %s",
+				remoteAddr, senderAddr)
+
+			// Send an ACK response
+			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
+			_, err := t.udpConn.WriteToUDP([]byte(ackMsg), remoteAddr)
+			if err != nil {
+				log.Printf("Failed to send ACK: %v", err)
+			} else {
+				log.Printf("Sent ACK to %s", remoteAddr)
+
+				// Store this peer for future UDP communication
+				t.udpPeers.Store(remoteAddr.String(), remoteAddr)
+
+				// Setup UDP data channel for this peer
+				t.setupUDPDataChannel(remoteAddr)
+			}
+
 		} else if strings.HasPrefix(message, "ACK:") {
-			// Handle ACK messages (existing code)
+			// Extract the sender's address
+			senderAddr := strings.TrimPrefix(message, "ACK:")
+			log.Printf("Received ACK from %s for hole punching", senderAddr)
+
+			// Signal the Dial method that connection was successful
+			select {
+			case t.connectedCh <- remoteAddr.String():
+				log.Printf("Signaled successful UDP connection to %s", remoteAddr)
+			default:
+				log.Printf("Connection channel full, couldn't signal")
+			}
+
+			// Store this peer for future UDP communication
+			t.udpPeers.Store(remoteAddr.String(), remoteAddr)
+
 		} else if strings.HasPrefix(message, "DATA_REQ:") {
 			// Handle data request: DATA_REQ:<requestID>:<fileID>:<chunkIndex>
 			parts := strings.Split(strings.TrimPrefix(message, "DATA_REQ:"), ":")
@@ -166,31 +237,28 @@ func (t *TCPTransport) handleUDPMessages() {
 				fileID, chunkIndex, remoteAddr, requestID)
 
 			// Process request in a separate goroutine
-			go func() {
-				// Get the file data (this would be implemented by FileServer)
-				// For now, simulate a response
-				chunkData := []byte("SIMULATED CHUNK DATA " + strconv.Itoa(chunkIndex))
-
-				// Send response: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<data>
-				respMsg := fmt.Sprintf("DATA_RESP:%s:%s:%d:", requestID, fileID, chunkIndex)
-
-				// Create the full message with binary data
-				respBytes := append([]byte(respMsg), chunkData...)
-
-				// Send the response
-				_, err := t.udpConn.WriteToUDP(respBytes, remoteAddr)
-				if err != nil {
-					log.Printf("Failed to send UDP data response: %v", err)
-				} else {
-					log.Printf("Sent UDP data response for file %s chunk %d (%d bytes)",
-						fileID, chunkIndex, len(chunkData))
-				}
-			}()
+			go t.handleUDPDataRequest(remoteAddr, fileID, chunkIndex)
 
 		} else if strings.HasPrefix(message, "DATA_RESP:") {
 			// Handle data response: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<data>
-			headerEnd := strings.Index(message, ":") + 10 // Find the 4th colon
-			if headerEnd == -1 {
+			// Find the 4th colon (after the "DATA_RESP:" prefix)
+			prefixLen := len("DATA_RESP:")
+			rest := message[prefixLen:]
+
+			// Find the position of the third colon in the rest of the string
+			colonCount := 0
+			headerEnd := 0
+			for i, ch := range rest {
+				if ch == ':' {
+					colonCount++
+					if colonCount == 3 {
+						headerEnd = prefixLen + i
+						break
+					}
+				}
+			}
+
+			if headerEnd == 0 {
 				log.Printf("Invalid DATA_RESP format from %s", remoteAddr)
 				continue
 			}
