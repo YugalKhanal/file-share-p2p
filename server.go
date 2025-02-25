@@ -177,9 +177,11 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	// Try UDP peers first
 	s.udpPeersMu.RLock()
 	hasUDPPeers := len(s.udpPeers) > 0
+	log.Printf("Checking UDP peers for download: found %d peers", len(s.udpPeers))
 	udpPeers := make([]string, 0, len(s.udpPeers))
 	for peer := range s.udpPeers {
 		udpPeers = append(udpPeers, peer)
+		log.Printf("Available UDP peer: %s", peer)
 	}
 	s.udpPeersMu.RUnlock()
 
@@ -199,9 +201,10 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			// Use a unique request ID to track this specific request
 			requestID := fmt.Sprintf("%s-%d-%d", fileID, chunkIndex, time.Now().UnixNano())
 
-			// Setup a response handler
+			// Setup a response handler with better logging
 			transport.RegisterUDPResponseHandler(requestID, func(data []byte, err error) {
 				if err != nil {
+					log.Printf("UDP download error: %v", err)
 					select {
 					case errChan <- err:
 					default:
@@ -209,9 +212,11 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 					return
 				}
 
+				log.Printf("Received UDP chunk data response: %d bytes", len(data))
 				select {
 				case respChan <- data:
 				default:
+					log.Printf("Warning: Response channel is full")
 				}
 			})
 
@@ -222,17 +227,21 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			for _, udpPeer := range udpPeers {
 				log.Printf("Requesting chunk %d via UDP from peer %s", chunkIndex, udpPeer)
 
-				// Send the request
+				// Send the request with better logging
 				err := transport.RequestUDPData(udpPeer, fileID, chunkIndex, requestID)
 				if err != nil {
 					log.Printf("Failed to send UDP request to %s: %v", udpPeer, err)
 					continue
 				}
 
+				log.Printf("Successfully sent UDP request to %s", udpPeer)
+
 				// Wait for response with timeout
 				timeout := 10 * time.Second
 				select {
 				case data := <-respChan:
+					log.Printf("Received UDP data response: %d bytes", len(data))
+
 					// Write data to file
 					if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
 						log.Printf("Failed to write UDP chunk data: %v", err)
@@ -257,7 +266,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	}
 
 	// Fall back to TCP peers if UDP failed or not available
-	for attempt := range maxRetries {
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Get current list of peers and shuffle them for load balancing
 		s.mu.RLock()
 		peers := make([]p2p.Peer, 0, len(s.peers))
@@ -623,6 +632,22 @@ func (s *FileServer) onPeer(peer p2p.Peer) error {
 	return nil
 }
 
+// Update the onUDPPeer function in server.go
+func (s *FileServer) onUDPPeer(peerAddr string) {
+	log.Printf("New UDP peer available: %s", peerAddr)
+
+	// Store the UDP peer
+	s.udpPeersMu.Lock()
+	if s.udpPeers == nil {
+		s.udpPeers = make(map[string]bool)
+	}
+	s.udpPeers[peerAddr] = true
+	s.udpPeersMu.Unlock()
+
+	log.Printf("Added UDP peer %s to available peer list (total UDP peers: %d)",
+		peerAddr, len(s.udpPeers))
+}
+
 func (s *FileServer) ShareFile(filePath string) error {
 	fileID, err := s.generateFileID(filePath)
 	if err != nil {
@@ -815,10 +840,26 @@ func (s *FileServer) DownloadFile(fileID string) error {
 		return fmt.Errorf("failed to save metadata locally: %v", err)
 	}
 
+	// Initialize UDP peers map if not already done
+	if s.udpPeers == nil {
+		s.udpPeers = make(map[string]bool)
+	}
+
 	// Connect to all available peers, not just one
 	if err := s.connectToAllPeers(fileID); err != nil {
 		log.Printf("Warning: Could not connect to all peers: %v", err)
 	}
+
+	// Wait a moment for UDP connections to be fully established
+	time.Sleep(1 * time.Second)
+
+	// Log UDP peer counts
+	s.udpPeersMu.RLock()
+	log.Printf("Available UDP peers for download: %d", len(s.udpPeers))
+	for peer := range s.udpPeers {
+		log.Printf("  - UDP peer: %s", peer)
+	}
+	s.udpPeersMu.RUnlock()
 
 	// Initialize piece manager
 	pieceManager := NewPieceManager(meta.NumChunks, meta.ChunkHashes)
@@ -827,7 +868,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	s.mu.RLock()
 	for addr := range s.peers {
 		pieces := make([]int, meta.NumChunks)
-		for i := range meta.NumChunks {
+		for i := 0; i < meta.NumChunks; i++ {
 			pieces[i] = i
 		}
 		pieceManager.UpdatePeerPieces(addr, pieces)
@@ -901,16 +942,24 @@ func (s *FileServer) DownloadFile(fileID string) error {
 			piecesPerSecond := float64(currentCompleted) / time.Since(startTime).Seconds()
 			remainingPieces := meta.NumChunks - currentCompleted
 			eta := float64(remainingPieces) / piecesPerSecond
+			if piecesPerSecond == 0 {
+				eta = float64(0)
+			}
 
 			// Also log the number of connected peers
 			s.mu.RLock()
 			numPeers := len(s.peers)
 			s.mu.RUnlock()
 
-			log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds - Connected peers: %d",
+			// Check UDP peers too
+			s.udpPeersMu.RLock()
+			numUDPPeers := len(s.udpPeers)
+			s.udpPeersMu.RUnlock()
+
+			log.Printf("Progress: %d/%d pieces (%.2f%%) - %.2f pieces/sec - ETA: %.1f seconds - Connected peers: %d (TCP), %d (UDP)",
 				currentCompleted, meta.NumChunks,
 				float64(currentCompleted)/float64(meta.NumChunks)*100,
-				piecesPerSecond, eta, numPeers)
+				piecesPerSecond, eta, numPeers, numUDPPeers)
 		}
 	}()
 
@@ -920,12 +969,18 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 	// Main download loop
 	for !pieceManager.IsComplete() {
-		// Get available peers
+		// Get available peers (both TCP and UDP)
 		s.mu.RLock()
 		peerCount := len(s.peers)
 		s.mu.RUnlock()
 
-		if peerCount == 0 {
+		s.udpPeersMu.RLock()
+		udpPeerCount := len(s.udpPeers)
+		s.udpPeersMu.RUnlock()
+
+		totalPeerCount := peerCount + udpPeerCount
+
+		if totalPeerCount == 0 {
 			// No peers available, try to refresh peers
 			if err := s.connectToAllPeers(fileID); err != nil {
 				return fmt.Errorf("all peers disconnected and failed to find new peers")
@@ -936,8 +991,8 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 		// Request more pieces than we have workers to keep the pipeline full
 		requestMultiple := 2
-		if peerCount > 1 {
-			requestMultiple = peerCount * 2
+		if totalPeerCount > 1 {
+			requestMultiple = totalPeerCount * 2
 		}
 		pieces := pieceManager.GetNextPieces(maxConcurrent * requestMultiple)
 

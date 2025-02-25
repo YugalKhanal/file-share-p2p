@@ -272,6 +272,8 @@ func (t *TCPTransport) Dial(addr string) error {
 			t.OnUDPPeer(peerAddr)
 		}
 
+		log.Printf("Notified FileServer about new UDP peer: %s", peerAddr)
+
 		return nil
 	case err := <-errCh:
 		log.Printf("Connection error: %v", err)

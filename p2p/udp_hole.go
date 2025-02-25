@@ -9,18 +9,39 @@ import (
 	"time"
 )
 
-// Request data via UDP
 // RequestUDPData sends a data request over UDP
 func (t *TCPTransport) RequestUDPData(peerAddr, fileID string, chunkIndex int, requestID string) error {
 	// Get the UDPAddr for this peer
 	addrObj, ok := t.udpPeers.Load(peerAddr)
 	if !ok {
-		return fmt.Errorf("unknown UDP peer: %s", peerAddr)
+		log.Printf("Warning: UDP peer %s not found in peer map", peerAddr)
+		// Try to extract address and port
+		host, portStr, err := net.SplitHostPort(peerAddr)
+		if err != nil {
+			return fmt.Errorf("invalid peer address format: %s", peerAddr)
+		}
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return fmt.Errorf("invalid port in peer address: %s", peerAddr)
+		}
+
+		// Create UDP address
+		udpAddr := &net.UDPAddr{
+			IP:   net.ParseIP(host),
+			Port: port,
+		}
+
+		// Store for future use
+		t.udpPeers.Store(peerAddr, udpAddr)
+
+		addrObj = udpAddr
+		log.Printf("Created new UDP address for peer: %s", udpAddr)
 	}
 
 	udpAddr, ok := addrObj.(*net.UDPAddr)
 	if !ok {
-		return fmt.Errorf("invalid UDP peer address type")
+		return fmt.Errorf("invalid UDP peer address type for %s", peerAddr)
 	}
 
 	// Create request message
@@ -28,10 +49,13 @@ func (t *TCPTransport) RequestUDPData(peerAddr, fileID string, chunkIndex int, r
 	reqMsg := fmt.Sprintf("DATA_REQ:%s:%s:%d", requestID, fileID, chunkIndex)
 
 	// Send the request
-	_, err := t.udpConn.WriteToUDP([]byte(reqMsg), udpAddr)
+	n, err := t.udpConn.WriteToUDP([]byte(reqMsg), udpAddr)
 	if err != nil {
 		return fmt.Errorf("failed to send UDP data request: %v", err)
 	}
+
+	log.Printf("Sent UDP data request for file %s chunk %d to %s (requestID: %s, bytes: %d)",
+		fileID, chunkIndex, udpAddr, requestID, n)
 
 	// Track this request
 	t.udpRequestsMu.Lock()
@@ -43,9 +67,6 @@ func (t *TCPTransport) RequestUDPData(peerAddr, fileID string, chunkIndex int, r
 		Attempts:   1,
 	}
 	t.udpRequestsMu.Unlock()
-
-	log.Printf("Sent UDP data request for file %s chunk %d to %s (requestID: %s)",
-		fileID, chunkIndex, udpAddr, requestID)
 
 	return nil
 }
