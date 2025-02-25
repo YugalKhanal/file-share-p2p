@@ -685,12 +685,24 @@ func (t *UDPTransport) handleUDPMessages() {
 				packetNum+1, totalPackets, requestID, fileID, chunkIndex)
 
 			// Check if all parts received
+			// In handleUDPMessages() function in udp_transport.go, update the multi-packet handling code:
+
+			// When all parts of a multi-packet transfer are received:
 			if info.ReceivedParts >= info.NumPackets {
 				log.Printf("All %d parts received for request %s, processing complete response",
 					info.NumPackets, requestID)
 
 				// Reconstruct the full data
 				fullData := multiPacketData[requestID]
+
+				// Parse fileID and chunkIndex from the requestID (typically formatted as "fileID-chunkIndex-timestamp")
+				parts := strings.Split(requestID, "-")
+				if len(parts) >= 2 {
+					fileID := parts[0]
+					chunkIndex, _ := strconv.Atoi(parts[1])
+					log.Printf("Successfully reconstructed chunk %d for file %s (%d bytes)",
+						chunkIndex, fileID, len(fullData))
+				}
 
 				// Clean up
 				delete(multiPacketData, requestID)

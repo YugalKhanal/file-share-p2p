@@ -253,7 +253,6 @@ func (s *FileServer) consumeRPCMessages() {
 }
 
 func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, outputFile *os.File) error {
-	// At the beginning of the method
 	log.Printf("Starting download for chunk %d of file %s", chunkIndex, fileID)
 
 	// Track retry attempts per piece
