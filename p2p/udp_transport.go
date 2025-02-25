@@ -39,11 +39,11 @@ func NewUDPTransport(listenAddr string) *UDPTransport {
 
 	// Use a UDP port that's offset from the TCP port
 	port, _ := strconv.Atoi(portStr)
-	udpPort := port + 1 // Use TCP port + 1 for UDP
+	udpPort := port + 2 // Change +1 to +2 here to be consistent
 	udpListenAddr := fmt.Sprintf(":%d", udpPort)
 
 	t := &UDPTransport{
-		ListenAddr:  udpListenAddr, // Use the offset port
+		ListenAddr:  udpListenAddr,
 		rpcch:       make(chan RPC, 1024),
 		connectedCh: make(chan string, 1),
 		udpDataCh:   make(chan UDPDataPacket, 100),

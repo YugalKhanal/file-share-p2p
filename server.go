@@ -54,9 +54,9 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 		portStr = "3000" // Default port if parsing fails
 	}
 
-	// Calculate UDP port (TCP port + 1)
+	// Calculate UDP port (TCP port + 2)
 	port, _ := strconv.Atoi(portStr)
-	udpPort := port + 1
+	udpPort := port + 2
 	udpListenAddr := fmt.Sprintf(":%d", udpPort)
 
 	tcpOpts := p2p.TCPTransportOpts{
@@ -205,9 +205,9 @@ func getPeerAddress(listenAddr string) (string, error) {
 		tcpPort = portStr
 	}
 
-	// Calculate UDP port (TCP port + 1)
+	// Calculate UDP port (TCP port + 2) - fix the +1 to +2 to match what your code is doing
 	tcpPortInt, _ := strconv.Atoi(tcpPort)
-	udpPort := strconv.Itoa(tcpPortInt + 1)
+	udpPort := strconv.Itoa(tcpPortInt + 2) // Change +1 to +2 here
 
 	// Return addresses in a format that can be parsed: publicIP:tcpPort|publicIP:udpPort|localIP:tcpPort|localIP:udpPort
 	return fmt.Sprintf("%s:%s|%s:%s|%s:%s|%s:%s",
