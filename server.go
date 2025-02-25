@@ -70,9 +70,49 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 		peers:         make(map[string]p2p.Peer),
 		activeFiles:   make(map[string]*shared.Metadata),
 		activeFilesMu: sync.RWMutex{},
+		udpPeers:      make(map[string]bool),
 	}
+
 	transport.SetOnPeer(server.onPeer)
+	transport.OnUDPPeer = server.onUDPPeer
+	transport.OnUDPDataRequest = server.handleUDPDataRequest
+
 	return server
+}
+
+func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte, error) {
+	// First check if we're actively seeding this file
+	s.activeFilesMu.RLock()
+	meta, isActive := s.activeFiles[fileID]
+	s.activeFilesMu.RUnlock()
+
+	if !isActive {
+		return nil, fmt.Errorf("file %s is not being actively seeded", fileID)
+	}
+
+	if chunkIndex >= meta.NumChunks {
+		return nil, fmt.Errorf("invalid chunk index %d, file only has %d chunks",
+			chunkIndex, meta.NumChunks)
+	}
+
+	// Read chunk with retry logic
+	var chunkData []byte
+	var err error
+	for retries := range 3 {
+		chunkData, err = s.store.ReadChunk(meta.OriginalPath, chunkIndex)
+		if err == nil {
+			break
+		}
+		log.Printf("Error reading chunk (attempt %d/3): %v", retries+1, err)
+		time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to read chunk after retries: %v", err)
+	}
+
+	log.Printf("Successfully read chunk %d (%d bytes) for UDP transfer", chunkIndex, len(chunkData))
+	return chunkData, nil
 }
 
 func isPrivateIP(ip net.IP) bool {

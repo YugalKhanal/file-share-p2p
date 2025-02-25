@@ -73,11 +73,12 @@ func (p *TCPPeer) Send(b []byte) error {
 }
 
 type TCPTransportOpts struct {
-	ListenAddr    string
-	HandshakeFunc HandshakeFunc
-	Decoder       Decoder
-	OnPeer        func(Peer) error
-	OnUDPPeer     func(string) error // Callback for UDP peers
+	ListenAddr       string
+	HandshakeFunc    HandshakeFunc
+	Decoder          Decoder
+	OnPeer           func(Peer) error
+	OnUDPPeer        func(string)
+	OnUDPDataRequest func(string, int) ([]byte, error)
 }
 
 type TCPTransport struct {
