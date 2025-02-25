@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/gob"
 	"encoding/hex"
@@ -126,6 +127,12 @@ func getPeerAddress(listenAddr string) (string, error) {
 	port := listenAddr
 	if strings.HasPrefix(port, ":") {
 		port = port[1:]
+	} else {
+		_, portStr, err := net.SplitHostPort(listenAddr)
+		if err != nil {
+			return "", fmt.Errorf("failed to extract port from listen address: %v", err)
+		}
+		port = portStr
 	}
 
 	// Return both addresses in a format that peers can use
@@ -416,6 +423,14 @@ func (s *FileServer) connectToAllPeers(fileID string) error {
 		myAddr = "localhost" + myAddr
 	}
 
+	// Create a context with timeout for all connection attempts
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Add a channel for detecting when first successful connection is made
+	firstSuccessCh := make(chan struct{}, 1)
+	allDoneCh := make(chan struct{})
+
 	// Connect to each peer in parallel
 	for _, peerAddr := range peerList {
 		addresses := strings.Split(peerAddr, "|")
@@ -439,41 +454,70 @@ func (s *FileServer) connectToAllPeers(fileID string) error {
 				defer wg.Done()
 
 				log.Printf("Attempting to connect to peer: %s", addr)
-				if err := s.opts.Transport.Dial(addr); err != nil {
-					log.Printf("Failed to connect to peer %s: %v", addr, err)
+
+				// Try to establish connection
+				connErr := s.opts.Transport.Dial(addr)
+
+				// Check if connection succeeded
+				select {
+				case <-ctx.Done():
+					// Context already canceled, no need to continue
 					return
-				}
+				default:
+					if connErr != nil {
+						log.Printf("Failed to connect to peer %s: %v", addr, connErr)
+					} else {
+						// Wait briefly for the connection to be established
+						time.Sleep(500 * time.Millisecond)
 
-				// Wait briefly for the connection to be established
-				time.Sleep(time.Second)
+						s.mu.RLock()
+						_, connected := s.peers[addr]
+						s.mu.RUnlock()
 
-				s.mu.RLock()
-				_, connected := s.peers[addr]
-				s.mu.RUnlock()
+						if connected {
+							log.Printf("Successfully connected to peer: %s", addr)
+							connectionsMutex.Lock()
+							connectionsMade++
+							connectionsMutex.Unlock()
 
-				if connected {
-					log.Printf("Successfully connected to peer: %s", addr)
-					connectionsMutex.Lock()
-					connectionsMade++
-					connectionsMutex.Unlock()
+							// Signal that we have at least one connection
+							select {
+							case firstSuccessCh <- struct{}{}:
+							default:
+							}
+						}
+					}
 				}
 			}(addr)
 		}
 	}
 
-	// Wait for all connection attempts
-	wg.Wait()
+	// Start a goroutine to wait for all connection attempts
+	go func() {
+		wg.Wait()
+		close(allDoneCh)
+	}()
 
-	connectionsMutex.Lock()
-	numConnections := connectionsMade
-	connectionsMutex.Unlock()
+	// Wait for either first success, all attempts to finish, or timeout
+	select {
+	case <-firstSuccessCh:
+		// Got at least one connection, we can proceed
+		log.Printf("Successfully established at least one peer connection")
+		return nil
+	case <-allDoneCh:
+		// All connection attempts finished, check results
+		connectionsMutex.Lock()
+		numConnections := connectionsMade
+		connectionsMutex.Unlock()
 
-	if numConnections == 0 {
-		return fmt.Errorf("failed to establish any peer connections")
+		if numConnections == 0 {
+			return fmt.Errorf("failed to establish any peer connections")
+		}
+		log.Printf("Connected to %d peers for file %s", numConnections, fileID)
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("timed out waiting for peer connections")
 	}
-
-	log.Printf("Connected to %d peers for file %s", numConnections, fileID)
-	return nil
 }
 
 func (s *FileServer) onPeer(peer p2p.Peer) error {

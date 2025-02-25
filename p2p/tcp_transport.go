@@ -152,11 +152,12 @@ func (t *TCPTransport) Dial(addr string) error {
 				Port: port, // Use the port from the target address
 			}
 
+			// Fix: Ensure we're sending a valid listen address with correct format
 			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
 			log.Printf("Starting hole punching to %s (UDP: %s)", targetAddr, udpAddr)
 
 			// Send punch messages with exponential backoff
-			for i := 0; i < 5; i++ {
+			for i := range 5 {
 				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
 				if err != nil {
 					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
@@ -181,6 +182,8 @@ func (t *TCPTransport) Dial(addr string) error {
 			}
 		}(address)
 	}
+
+	// Rest of the function remains the same...
 
 	// Wait longer for hole punching to work
 	log.Printf("Waiting for connection success or timeout")

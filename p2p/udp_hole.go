@@ -31,47 +31,44 @@ func (t *TCPTransport) setupUDPListener() error {
 func (t *TCPTransport) handleUDPMessages() {
 	log.Printf("Starting UDP message handler")
 	buf := make([]byte, 1024)
-
 	for {
 		n, remoteAddr, err := t.udpConn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf("UDP read error: %v", err)
 			continue
 		}
-
 		message := string(buf[:n])
 		log.Printf("Received UDP message from %s: %s", remoteAddr, message)
-
 		parts := strings.Split(message, ":")
 		if len(parts) != 2 {
 			log.Printf("Invalid message format: %s", message)
 			continue
 		}
-
 		messageType, tcpAddr := parts[0], parts[1]
 		switch messageType {
 		case "PUNCH":
 			log.Printf("Received PUNCH from %s for TCP address %s", remoteAddr, tcpAddr)
-
-			// Extract port from punch message address
-			_, punchPortStr, err := net.SplitHostPort(tcpAddr)
+			// Check if tcpAddr is valid
+			if tcpAddr == "" {
+				log.Printf("Empty TCP address in punch message")
+				continue
+			}
+			// Extract port from punch message address - skip the host since we're not using it
+			_, portStr, err := net.SplitHostPort(tcpAddr)
 			if err != nil {
 				log.Printf("Invalid TCP address in punch message: %v", err)
 				continue
 			}
-
-			punchPort, err := strconv.Atoi(punchPortStr)
+			punchPort, err := strconv.Atoi(portStr)
 			if err != nil {
 				log.Printf("Invalid port in punch message: %v", err)
 				continue
 			}
-
 			// Send acknowledgment using the same port as the punch message
 			ackAddr := &net.UDPAddr{
 				IP:   remoteAddr.IP,
 				Port: punchPort,
 			}
-
 			ackMsg := fmt.Sprintf("ACK:%s", t.ListenAddr)
 			_, err = t.udpConn.WriteToUDP([]byte(ackMsg), ackAddr)
 			if err != nil {
@@ -79,7 +76,6 @@ func (t *TCPTransport) handleUDPMessages() {
 				continue
 			}
 			log.Printf("Sent ACK to %s", ackAddr)
-
 			// Try TCP connection after small delay
 			go func() {
 				time.Sleep(100 * time.Millisecond)
@@ -91,7 +87,6 @@ func (t *TCPTransport) handleUDPMessages() {
 					log.Printf("Failed to establish TCP connection to %s: %v", tcpAddr, err)
 				}
 			}()
-
 		case "ACK":
 			log.Printf("Received ACK from %s for TCP address %s", remoteAddr, tcpAddr)
 			select {
