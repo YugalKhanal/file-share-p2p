@@ -90,13 +90,9 @@ func (t *UDPTransport) Dial(addr string) error {
 	// Create a wait group for the punch attempts
 	var wg sync.WaitGroup
 
-	// Try hole punching for each address
-	for i, address := range addrs {
-		// Skip TCP addresses (even indexes in our format)
-		if i%2 == 0 {
-			continue // Skip TCP addresses when in UDP transport
-		}
-
+	// Try hole punching for each address - attempt with ALL addresses, not just odd ones
+	// as the peer might have announced in a different format
+	for _, address := range addrs {
 		wg.Add(1)
 		go func(targetAddr string) {
 			defer wg.Done()
@@ -416,7 +412,12 @@ func (t *UDPTransport) handleUDPMessages() {
 			continue
 		}
 
-		message := string(buf[:n])
+		// Make a copy of the data to prevent it from being overwritten
+		data := make([]byte, n)
+		copy(data, buf[:n])
+		message := string(data)
+
+		log.Printf("Received UDP message from %s: %s", remoteAddr, message[:min(50, len(message))])
 
 		// Handle different message types
 		if strings.HasPrefix(message, "PUNCH:") {

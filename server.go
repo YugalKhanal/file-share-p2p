@@ -160,9 +160,11 @@ func isPrivateIP(ip net.IP) bool {
 
 func filterPeerList(peerList []string) []string {
 	var filtered []string
-	for _, peer := range peerList {
-		addresses := strings.Split(peer, "|")
+	for _, peerAddr := range peerList {
+		addresses := strings.Split(peerAddr, "|")
 		for _, addr := range addresses {
+			// Every other address is UDP (odd indexes)
+			// We want to include both TCP and UDP addresses in the filtered list
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				continue
@@ -175,7 +177,13 @@ func filterPeerList(peerList []string) []string {
 	}
 	if len(filtered) == 0 {
 		log.Printf("Warning: No public IP peers found, falling back to all peers")
-		return peerList // fallback to all peers
+		// Flatten the peer list by extracting all addresses
+		var flattened []string
+		for _, peerAddr := range peerList {
+			addresses := strings.Split(peerAddr, "|")
+			flattened = append(flattened, addresses...)
+		}
+		return flattened // fallback to all peers
 	}
 	return filtered
 }
@@ -208,7 +216,8 @@ func getPeerAddress(listenAddr string) (string, error) {
 	// Log the port
 	log.Printf("Announcing TCP and UDP on port %s", port)
 
-	// Return addresses in a format that can be parsed - using the same port for both TCP and UDP
+	// Return addresses in a format that can be parsed
+	// First public TCP, then public UDP, then local TCP, then local UDP
 	return fmt.Sprintf("%s:%s|%s:%s|%s:%s|%s:%s",
 		publicIP, port,
 		publicIP, port,
@@ -585,10 +594,18 @@ func (s *FileServer) connectToAllPeers(fileID string) error {
 		return fmt.Errorf("no peers are currently sharing file %s", fileID)
 	}
 
-	// Filter peer list to avoid connecting to private IPs when not needed
-	peerList = filterPeerList(peerList)
+	// Extract individual addresses from the combined format
+	var flattenedAddresses []string
+	for _, peerAddr := range peerList {
+		addresses := strings.Split(peerAddr, "|")
+		flattenedAddresses = append(flattenedAddresses, addresses...)
+	}
 
-	log.Printf("Received %d peers from tracker", len(peerList))
+	// Filter peer list to avoid connecting to private IPs when not needed
+	filteredAddresses := filterPeerList(flattenedAddresses)
+
+	log.Printf("Received %d peers with %d unique addresses from tracker",
+		len(peerList), len(filteredAddresses))
 
 	// Create a wait group to track connection attempts
 	var wg sync.WaitGroup
@@ -610,64 +627,61 @@ func (s *FileServer) connectToAllPeers(fileID string) error {
 	allDoneCh := make(chan struct{})
 
 	// Connect to each peer in parallel
-	for _, peerAddr := range peerList {
-		addresses := strings.Split(peerAddr, "|")
-		for _, addr := range addresses {
-			if addr == myAddr {
-				log.Printf("Skipping own address: %s", addr)
-				continue
-			}
+	for _, addr := range filteredAddresses {
+		if addr == myAddr {
+			log.Printf("Skipping own address: %s", addr)
+			continue
+		}
 
-			// Check if we're already connected to this peer
-			s.mu.RLock()
-			_, alreadyConnected := s.peers[addr]
-			s.mu.RUnlock()
+		// Check if we're already connected to this peer
+		s.mu.RLock()
+		_, alreadyConnected := s.peers[addr]
+		s.mu.RUnlock()
 
-			if alreadyConnected {
-				continue
-			}
+		if alreadyConnected {
+			continue
+		}
 
-			wg.Add(1)
-			go func(addr string) {
-				defer wg.Done()
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
 
-				log.Printf("Attempting to connect to peer: %s", addr)
+			log.Printf("Attempting to connect to peer: %s", addr)
 
-				// Try to establish connection
-				connErr := s.opts.Transport.Dial(addr)
+			// Try to establish connection
+			connErr := s.opts.Transport.Dial(addr)
 
-				// Check if connection succeeded
-				select {
-				case <-ctx.Done():
-					// Context already canceled, no need to continue
-					return
-				default:
-					if connErr != nil {
-						log.Printf("Failed to connect to peer %s: %v", addr, connErr)
-					} else {
-						// Wait briefly for the connection to be established
-						time.Sleep(500 * time.Millisecond)
+			// Check if connection succeeded
+			select {
+			case <-ctx.Done():
+				// Context already canceled, no need to continue
+				return
+			default:
+				if connErr != nil {
+					log.Printf("Failed to connect to peer %s: %v", addr, connErr)
+				} else {
+					// Wait briefly for the connection to be established
+					time.Sleep(500 * time.Millisecond)
 
-						s.mu.RLock()
-						_, connected := s.peers[addr]
-						s.mu.RUnlock()
+					s.mu.RLock()
+					_, connected := s.peers[addr]
+					s.mu.RUnlock()
 
-						if connected {
-							log.Printf("Successfully connected to peer: %s", addr)
-							connectionsMutex.Lock()
-							connectionsMade++
-							connectionsMutex.Unlock()
+					if connected {
+						log.Printf("Successfully connected to peer: %s", addr)
+						connectionsMutex.Lock()
+						connectionsMade++
+						connectionsMutex.Unlock()
 
-							// Signal that we have at least one connection
-							select {
-							case firstSuccessCh <- struct{}{}:
-							default:
-							}
+						// Signal that we have at least one connection
+						select {
+						case firstSuccessCh <- struct{}{}:
+						default:
 						}
 					}
 				}
-			}(addr)
-		}
+			}
+		}(addr)
 	}
 
 	// Start a goroutine to wait for all connection attempts
