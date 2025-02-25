@@ -90,6 +90,9 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 		return nil, fmt.Errorf("file %s is not being actively seeded", fileID)
 	}
 
+	log.Printf("Handling UDP data request for file %s chunk %d, metadata: %+v",
+		fileID, chunkIndex, meta)
+
 	if chunkIndex >= meta.NumChunks {
 		return nil, fmt.Errorf("invalid chunk index %d, file only has %d chunks",
 			chunkIndex, meta.NumChunks)
@@ -285,6 +288,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 					// Write data to file
 					if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
 						log.Printf("Failed to write UDP chunk data: %v", err)
+						log.Printf("Data size: %d, expected chunk size: %d", len(data), chunkSize)
 						continue
 					}
 
@@ -306,7 +310,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	}
 
 	// Fall back to TCP peers if UDP failed or not available
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := range maxRetries {
 		// Get current list of peers and shuffle them for load balancing
 		s.mu.RLock()
 		peers := make([]p2p.Peer, 0, len(s.peers))
@@ -908,7 +912,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	s.mu.RLock()
 	for addr := range s.peers {
 		pieces := make([]int, meta.NumChunks)
-		for i := 0; i < meta.NumChunks; i++ {
+		for i := range meta.NumChunks {
 			pieces[i] = i
 		}
 		pieceManager.UpdatePeerPieces(addr, pieces)
