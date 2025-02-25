@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,15 +49,26 @@ type FileServer struct {
 
 // In server.go, update makeServer function
 func makeServer(listenAddr, bootstrapNode string) *FileServer {
+	// Parse the TCP listen address
+	_, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		portStr = "3000" // Default port if parsing fails
+	}
+
+	// Calculate UDP port (TCP port + 1)
+	port, _ := strconv.Atoi(portStr)
+	udpPort := port + 1
+	udpListenAddr := fmt.Sprintf(":%d", udpPort)
+
 	tcpOpts := p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
 		HandshakeFunc: p2p.NOPHandshakeFunc,
 		Decoder:       p2p.DefaultDecoder{},
 	}
 
-	// Create both TCP and UDP transports
+	// Create both TCP and UDP transports with different ports
 	tcpTransport := p2p.NewTCPTransport(tcpOpts)
-	udpTransport := p2p.NewUDPTransport(listenAddr)
+	udpTransport := p2p.NewUDPTransport(udpListenAddr)
 
 	// Create combined transport manager
 	transportManager := NewTransportManager(tcpTransport, udpTransport)
@@ -182,20 +194,25 @@ func getPeerAddress(listenAddr string) (string, error) {
 		return "", fmt.Errorf("failed to get local IP: %v", err)
 	}
 
-	// Extract port from listen address
-	port := listenAddr
-	if strings.HasPrefix(port, ":") {
-		port = port[1:]
+	// Extract TCP port from listen address
+	tcpPort := listenAddr
+	if strings.HasPrefix(tcpPort, ":") {
+		tcpPort = tcpPort[1:]
 	} else {
 		_, portStr, err := net.SplitHostPort(listenAddr)
 		if err != nil {
 			return "", fmt.Errorf("failed to extract port from listen address: %v", err)
 		}
-		port = portStr
+		tcpPort = portStr
 	}
 
-	// Return both addresses in a format that peers can use
-	return fmt.Sprintf("%s:%s|%s:%s", publicIP, port, localIP, port), nil
+	// Calculate UDP port (TCP port + 1)
+	tcpPortInt, _ := strconv.Atoi(tcpPort)
+	udpPort := strconv.Itoa(tcpPortInt + 1)
+
+	// Return TCP and UDP addresses in a format that peers can use
+	// Format: publicIP:tcpPort:udpPort|localIP:tcpPort:udpPort
+	return fmt.Sprintf("%s:%s:%s|%s:%s:%s", publicIP, tcpPort, udpPort, localIP, tcpPort, udpPort), nil
 }
 
 func (s *FileServer) refreshPeers(fileID string) error {

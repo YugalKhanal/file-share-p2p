@@ -31,8 +31,19 @@ type UDPTransport struct {
 
 // NewUDPTransport creates a new UDPTransport
 func NewUDPTransport(listenAddr string) *UDPTransport {
+	// Parse the TCP address to get the port
+	_, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		portStr = "3000" // Default port if parsing fails
+	}
+
+	// Use a UDP port that's offset from the TCP port
+	port, _ := strconv.Atoi(portStr)
+	udpPort := port + 1 // Use TCP port + 1 for UDP
+	udpListenAddr := fmt.Sprintf(":%d", udpPort)
+
 	t := &UDPTransport{
-		ListenAddr:  listenAddr,
+		ListenAddr:  udpListenAddr, // Use the offset port
 		rpcch:       make(chan RPC, 1024),
 		connectedCh: make(chan string, 1),
 		udpDataCh:   make(chan UDPDataPacket, 100),
@@ -330,21 +341,25 @@ func (t *UDPTransport) StartUDPRequestTimeoutChecker() {
 	}
 }
 
+// setupUDPListener initializes and starts the UDP listener
 func (t *UDPTransport) setupUDPListener() error {
-	log.Printf("Setting up UDP listener on port %d", t.getPort())
+	log.Printf("Setting up UDP listener on %s", t.ListenAddr)
 
-	udpAddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
-		Port: t.getPort(),
+	// Parse the UDP address
+	addr, err := net.ResolveUDPAddr("udp", t.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve UDP address: %v", err)
 	}
 
-	var err error
-	t.udpConn, err = net.ListenUDP("udp", udpAddr)
+	// Create the UDP connection
+	t.udpConn, err = net.ListenUDP("udp", addr)
 	if err != nil {
 		return fmt.Errorf("UDP listen failed: %v", err)
 	}
 
 	log.Printf("UDP listener established successfully on %s", t.udpConn.LocalAddr())
+
+	// Start handling incoming UDP messages
 	go t.handleUDPMessages()
 	return nil
 }

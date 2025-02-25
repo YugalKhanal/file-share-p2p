@@ -70,25 +70,6 @@ func (t *TCPTransport) StartUDPRequestTimeoutChecker() {
 	}
 }
 
-func (t *TCPTransport) setupUDPListener() error {
-	log.Printf("Setting up UDP listener on port %d", t.getPort())
-
-	udpAddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
-		Port: t.getPort(),
-	}
-
-	var err error
-	t.udpConn, err = net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("UDP listen failed: %v", err)
-	}
-
-	log.Printf("UDP listener established successfully on %s", t.udpConn.LocalAddr())
-	go t.handleUDPMessages()
-	return nil
-}
-
 // Setup UDP data channel for file transfer
 func (t *TCPTransport) setupUDPDataChannel(remoteAddr *net.UDPAddr) {
 	log.Printf("UDP data channel established with %s", remoteAddr)
