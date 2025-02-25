@@ -152,22 +152,49 @@ func (t *TCPTransport) Dial(addr string) error {
 				Port: port, // Use the port from the target address
 			}
 
-			// Fix: Ensure we're sending a valid listen address with correct format
-			punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
-			log.Printf("Starting hole punching to %s (UDP: %s)", targetAddr, udpAddr)
+			// Ensure the listen address is properly formatted with a host
+			listenHost := "localhost"
+			if strings.HasPrefix(t.ListenAddr, ":") {
+				listenPort := t.ListenAddr[1:] // Remove the leading colon
+				listenAddr := fmt.Sprintf("%s:%s", listenHost, listenPort)
 
-			// Send punch messages with exponential backoff
-			for i := range 5 {
-				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
-				if err != nil {
-					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
-				} else {
-					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
+				// Create a properly formatted PUNCH message
+				punchMsg := fmt.Sprintf("PUNCH:%s", listenAddr)
+				log.Printf("Starting hole punching to %s (UDP: %s) with message: %s",
+					targetAddr, udpAddr, punchMsg)
+
+				// Send punch messages with exponential backoff
+				for i := 0; i < 5; i++ {
+					n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+					if err != nil {
+						log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
+					} else {
+						log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
+					}
+
+					// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+					backoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
+					time.Sleep(backoff)
 				}
+			} else {
+				// Listen address already has a host component
+				punchMsg := fmt.Sprintf("PUNCH:%s", t.ListenAddr)
+				log.Printf("Starting hole punching to %s (UDP: %s) with message: %s",
+					targetAddr, udpAddr, punchMsg)
 
-				// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
-				backoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
-				time.Sleep(backoff)
+				// Send punch messages with exponential backoff
+				for i := 0; i < 5; i++ {
+					n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
+					if err != nil {
+						log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
+					} else {
+						log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
+					}
+
+					// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+					backoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
+					time.Sleep(backoff)
+				}
 			}
 
 			// Try direct TCP connection as fallback
@@ -182,8 +209,6 @@ func (t *TCPTransport) Dial(addr string) error {
 			}
 		}(address)
 	}
-
-	// Rest of the function remains the same...
 
 	// Wait longer for hole punching to work
 	log.Printf("Waiting for connection success or timeout")
