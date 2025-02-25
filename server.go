@@ -47,7 +47,6 @@ type FileServer struct {
 	udpPeersMu       sync.RWMutex
 }
 
-// In server.go, update makeServer function
 func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	// Parse the TCP listen address
 	_, portStr, err := net.SplitHostPort(listenAddr)
@@ -263,85 +262,88 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	s.udpPeersMu.RUnlock()
 
 	if hasUDPPeers {
-		// Create a channel for receiving the UDP response
-		respChan := make(chan []byte, 1)
-		errChan := make(chan error, 1)
+		// Get the transport manager
+		transportManager, ok := s.opts.Transport.(*TransportManager)
+		if !ok {
+			log.Printf("Warning: Transport is not a TransportManager, can't use UDP")
+		} else {
+			// Try to get the UDP transport
+			udpTransport := transportManager.GetUDPTransport()
+			if udpTransport != nil {
+				// Create channels for receiving the UDP response
+				respChan := make(chan []byte, 1)
+				errChan := make(chan error, 1)
 
-		// Register a handler for UDP responses
-		transport, ok := s.opts.Transport.(*p2p.TCPTransport)
-		if ok {
-			log.Printf("Got TCPTransport for UDP data request")
-			// Use a unique request ID to track this specific request
-			requestID := fmt.Sprintf("%s-%d-%d", fileID, chunkIndex, time.Now().UnixNano())
-			log.Printf("Generated request ID: %s", requestID)
+				// Use a unique request ID to track this specific request
+				requestID := fmt.Sprintf("%s-%d-%d", fileID, chunkIndex, time.Now().UnixNano())
+				log.Printf("Generated request ID: %s", requestID)
 
-			// Setup a response handler with better logging
-			transport.RegisterUDPResponseHandler(requestID, func(data []byte, err error) {
-				log.Printf("UDP response handler called for request %s", requestID)
-				if err != nil {
-					log.Printf("UDP download error: %v", err)
-					select {
-					case errChan <- err:
-						log.Printf("Sent error to error channel")
-					default:
-						log.Printf("Error channel full, couldn't send error")
+				// Setup a response handler
+				udpTransport.RegisterUDPResponseHandler(requestID, func(data []byte, err error) {
+					log.Printf("UDP response handler called for request %s", requestID)
+					if err != nil {
+						log.Printf("UDP download error: %v", err)
+						select {
+						case errChan <- err:
+							log.Printf("Sent error to error channel")
+						default:
+							log.Printf("Error channel full, couldn't send error")
+						}
+						return
 					}
-					return
-				}
 
-				log.Printf("Received UDP chunk data response: %d bytes", len(data))
-				select {
-				case respChan <- data:
-					log.Printf("Sent data to response channel")
-				default:
-					log.Printf("Warning: Response channel is full")
-				}
-			})
+					log.Printf("Received UDP chunk data response: %d bytes", len(data))
+					select {
+					case respChan <- data:
+						log.Printf("Sent data to response channel")
+					default:
+						log.Printf("Warning: Response channel is full")
+					}
+				})
 
-			// Clean up when done
-			defer transport.UnregisterUDPResponseHandler(requestID)
+				// Clean up when done
+				defer udpTransport.UnregisterUDPResponseHandler(requestID)
 
-			// Try each UDP peer until success or all fail
-			for _, udpPeer := range udpPeers {
-				log.Printf("Requesting chunk %d via UDP from peer %s", chunkIndex, udpPeer)
+				// Try each UDP peer until success or all fail
+				for _, udpPeer := range udpPeers {
+					log.Printf("Requesting chunk %d via UDP from peer %s", chunkIndex, udpPeer)
 
-				// Send the request with better logging
-				err := transport.RequestUDPData(udpPeer, fileID, chunkIndex, requestID)
-				if err != nil {
-					log.Printf("Failed to send UDP request to %s: %v", udpPeer, err)
-					continue
-				}
-
-				log.Printf("Successfully sent UDP request to %s", udpPeer)
-
-				// Wait for response with timeout
-				timeout := 10 * time.Second
-				select {
-				case data := <-respChan:
-					log.Printf("Received UDP data response: %d bytes", len(data))
-
-					// Write data to file
-					if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
-						log.Printf("Failed to write UDP chunk data: %v", err)
+					// Send the request
+					err := udpTransport.RequestUDPData(udpPeer, fileID, chunkIndex, requestID)
+					if err != nil {
+						log.Printf("Failed to send UDP request to %s: %v", udpPeer, err)
 						continue
 					}
 
-					log.Printf("Successfully downloaded chunk %d via UDP", chunkIndex)
-					return nil
+					log.Printf("Successfully sent UDP request to %s", udpPeer)
 
-				case err := <-errChan:
-					log.Printf("UDP download error: %v", err)
-					continue
+					// Wait for response with timeout
+					timeout := 10 * time.Second
+					select {
+					case data := <-respChan:
+						log.Printf("Received UDP data response: %d bytes", len(data))
 
-				case <-time.After(timeout):
-					log.Printf("UDP request timed out for peer %s", udpPeer)
-					continue
+						// Write data to file
+						if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
+							log.Printf("Failed to write UDP chunk data: %v", err)
+							continue
+						}
+
+						log.Printf("Successfully downloaded chunk %d via UDP", chunkIndex)
+						return nil
+
+					case err := <-errChan:
+						log.Printf("UDP download error: %v", err)
+						continue
+
+					case <-time.After(timeout):
+						log.Printf("UDP request timed out for peer %s", udpPeer)
+						continue
+					}
 				}
-			}
 
-			log.Printf("All UDP peers failed, falling back to TCP")
-		} else {
-			log.Printf("Error: Could not get TCPTransport for UDP data request")
+				log.Printf("All UDP peers failed, falling back to TCP")
+			}
 		}
 	}
 

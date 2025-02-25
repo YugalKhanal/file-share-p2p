@@ -73,26 +73,16 @@ func (p *TCPPeer) Send(b []byte) error {
 }
 
 type TCPTransportOpts struct {
-	ListenAddr       string
-	HandshakeFunc    HandshakeFunc
-	Decoder          Decoder
-	OnPeer           func(Peer) error
-	OnUDPPeer        func(string)
-	OnUDPDataRequest func(string, int) ([]byte, error)
+	ListenAddr    string
+	HandshakeFunc HandshakeFunc
+	Decoder       Decoder
+	OnPeer        func(Peer) error
 }
 
 type TCPTransport struct {
 	TCPTransportOpts
-	listener            net.Listener
-	udpConn             *net.UDPConn
-	rpcch               chan RPC
-	punchingMap         sync.Map
-	connectedCh         chan string
-	udpPeers            sync.Map // Map of addr string -> *net.UDPAddr
-	udpDataCh           chan UDPDataPacket
-	udpResponseHandlers sync.Map // Map of requestID -> handler function
-	udpRequestsMu       sync.Mutex
-	udpRequests         map[string]UDPRequest // Track active requests by requestID
+	listener net.Listener
+	rpcch    chan RPC
 }
 
 type UDPDataPacket struct {
@@ -117,14 +107,7 @@ func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
 	t := &TCPTransport{
 		TCPTransportOpts: opts,
 		rpcch:            make(chan RPC, 1024),
-		connectedCh:      make(chan string, 10),
-		udpDataCh:        make(chan UDPDataPacket, 100),
-		udpRequests:      make(map[string]UDPRequest),
 	}
-
-	// Start the UDP request timeout checker
-	go t.StartUDPRequestTimeoutChecker()
-
 	return t
 }
 
@@ -225,12 +208,6 @@ func (t *TCPTransport) ListenAndAccept() error {
 	var err error
 	t.listener, err = net.Listen("tcp", t.ListenAddr)
 	if err != nil {
-		return err
-	}
-
-	// Setup UDP listener
-	if err := t.setupUDPListener(); err != nil {
-		t.listener.Close()
 		return err
 	}
 

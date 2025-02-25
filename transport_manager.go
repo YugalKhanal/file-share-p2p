@@ -30,6 +30,16 @@ func NewTransportManager(transports ...p2p.Transport) *TransportManager {
 	return tm
 }
 
+// GetUDPTransport returns the UDP transport if available
+func (tm *TransportManager) GetUDPTransport() *p2p.UDPTransport {
+	for _, t := range tm.transports {
+		if udpTransport, ok := t.(*p2p.UDPTransport); ok {
+			return udpTransport
+		}
+	}
+	return nil
+}
+
 // forwardMessages forwards messages from a transport to the main RPC channel
 func (tm *TransportManager) forwardMessages(t p2p.Transport) {
 	for rpc := range t.Consume() {
@@ -54,7 +64,6 @@ func (tm *TransportManager) Consume() <-chan p2p.RPC {
 	return tm.rpcch
 }
 
-// Dial attempts to dial using all transports until one succeeds
 // Dial attempts to dial using all transports until one succeeds
 func (tm *TransportManager) Dial(addr string) error {
 	log.Printf("TransportManager attempting to dial %s", addr)
