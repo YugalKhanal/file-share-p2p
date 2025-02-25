@@ -237,7 +237,6 @@ func (t *UDPTransport) RequestUDPData(peerAddr, fileID string, chunkIndex int, r
 
 		// Store for future use
 		t.udpPeers.Store(peerAddr, udpAddr)
-
 		addrObj = udpAddr
 		log.Printf("Created new UDP address for peer: %s", udpAddr)
 	}
@@ -377,34 +376,63 @@ func (t *UDPTransport) handleUDPDataRequest(remoteAddr *net.UDPAddr, fileID stri
 		chunkData, err := t.OnUDPDataRequest(fileID, chunkIndex)
 		if err != nil {
 			log.Printf("Failed to fetch chunk data: %v", err)
+
+			// Send error response
+			errMsg := fmt.Sprintf("DATA_ERR:%s:%s:%d:Error fetching chunk: %v",
+				requestID, fileID, chunkIndex, err)
+			t.udpConn.WriteToUDP([]byte(errMsg), remoteAddr)
 			return
 		}
 
-		// Send the data response
-		dataResp := fmt.Sprintf("DATA_RESP:%s:%s:%d:", requestID, fileID, chunkIndex)
+		// Limit data size for UDP
+		maxUDPSize := 60 * 1024 // 60KB is a safe size for most networks
+		if len(chunkData) > maxUDPSize {
+			log.Printf("Warning: Chunk data size (%d bytes) exceeds safe UDP packet size", len(chunkData))
 
-		// First send the header
-		_, err = t.udpConn.WriteToUDP([]byte(dataResp), remoteAddr)
+			// Send error response for large chunks
+			errMsg := fmt.Sprintf("DATA_ERR:%s:%s:%d:Chunk too large for UDP transfer",
+				requestID, fileID, chunkIndex)
+			t.udpConn.WriteToUDP([]byte(errMsg), remoteAddr)
+			return
+		}
+
+		// Send response header first
+		header := fmt.Sprintf("DATA_RESP:%s:%s:%d:%d", requestID, fileID, chunkIndex, len(chunkData))
+		_, err = t.udpConn.WriteToUDP([]byte(header), remoteAddr)
 		if err != nil {
-			log.Printf("Failed to send UDP data response header: %v", err)
+			log.Printf("Failed to send UDP header: %v", err)
 			return
 		}
 
-		// Then send the data
-		_, err = t.udpConn.WriteToUDP(chunkData, remoteAddr)
+		// Wait briefly to ensure header is received
+		time.Sleep(10 * time.Millisecond)
+
+		// Then send actual data in a separate packet
+		n, err := t.udpConn.WriteToUDP(chunkData, remoteAddr)
 		if err != nil {
 			log.Printf("Failed to send UDP data response: %v", err)
 		} else {
-			log.Printf("Successfully sent chunk %d (%d bytes) via UDP", chunkIndex, len(chunkData))
+			log.Printf("Successfully sent chunk %d (%d bytes) via UDP", chunkIndex, n)
 		}
 	} else {
-		log.Printf("Cannot handle UDP data request: no data request handler registered")
+		log.Printf("Cannot handle UDP data request: no data handler registered")
+
+		// Send error response
+		errMsg := fmt.Sprintf("DATA_ERR:%s:%s:%d:No data handler registered",
+			requestID, fileID, chunkIndex)
+		t.udpConn.WriteToUDP([]byte(errMsg), remoteAddr)
 	}
 }
 
 func (t *UDPTransport) handleUDPMessages() {
 	log.Printf("Starting UDP message handler")
 	buf := make([]byte, 64*1024) // Large buffer for data chunks
+
+	// Track expected data messages
+	expectingData := make(map[string]bool)
+	// dataBuffers := make(map[string][]byte)
+	var dataBuffersMu sync.Mutex
+
 	for {
 		n, remoteAddr, err := t.udpConn.ReadFromUDP(buf)
 		if err != nil {
@@ -417,7 +445,7 @@ func (t *UDPTransport) handleUDPMessages() {
 		copy(data, buf[:n])
 		message := string(data)
 
-		// Only log the first part of the message to avoid huge logs for data responses
+		// For logging, truncate very long messages
 		messagePreview := message
 		if len(messagePreview) > 60 {
 			messagePreview = messagePreview[:60] + "..." // Truncate for logging
@@ -426,7 +454,7 @@ func (t *UDPTransport) handleUDPMessages() {
 
 		// Handle different message types
 		if strings.HasPrefix(message, "PUNCH:") {
-			// Extract the sender's address from the punch message
+			// Handle PUNCH messages (existing code)
 			parts := strings.SplitN(message, ":", 2)
 			if len(parts) != 2 {
 				log.Printf("Invalid PUNCH format from %s: %s", remoteAddr, message)
@@ -452,7 +480,7 @@ func (t *UDPTransport) handleUDPMessages() {
 			}
 
 		} else if strings.HasPrefix(message, "ACK:") {
-			// Extract the sender's address from the ACK
+			// Handle ACK messages (existing code)
 			parts := strings.SplitN(message, ":", 2)
 			if len(parts) != 2 {
 				log.Printf("Invalid ACK format from %s: %s", remoteAddr, message)
@@ -488,75 +516,79 @@ func (t *UDPTransport) handleUDPMessages() {
 				continue
 			}
 
-			log.Printf("Received UDP data request for file %s chunk %d from %s (requestID: %s)",
-				fileID, chunkIndex, remoteAddr, requestID)
-
 			// Process request in a separate goroutine
 			go t.handleUDPDataRequest(remoteAddr, fileID, chunkIndex, requestID)
 
 		} else if strings.HasPrefix(message, "DATA_RESP:") {
-			// Handle data response: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<data>
-			// Find the position of the 4th colon (after the "DATA_RESP:" prefix)
-			prefixLen := len("DATA_RESP:")
-			colonCount := 0
-			headerEnd := 0
+			// Handle data response header: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<dataLength>
+			parts := strings.Split(strings.TrimPrefix(message, "DATA_RESP:"), ":")
+			if len(parts) != 4 {
+				log.Printf("Invalid DATA_RESP header from %s: %s", remoteAddr, message)
+				continue
+			}
 
-			for i := prefixLen; i < len(message); i++ {
-				if message[i] == ':' {
-					colonCount++
-					if colonCount == 3 {
-						headerEnd = i + 1
-						break
+			requestID := parts[0]
+			fileID := parts[1]
+			chunkIndex, err := strconv.Atoi(parts[2])
+			if err != nil {
+				log.Printf("Invalid chunk index in DATA_RESP from %s: %s", remoteAddr, parts[2])
+				continue
+			}
+
+			dataLength, err := strconv.Atoi(parts[3])
+			if err != nil {
+				log.Printf("Invalid data length in DATA_RESP from %s: %s", remoteAddr, parts[3])
+				continue
+			}
+
+			log.Printf("Received UDP data header for file %s chunk %d from %s (expected length: %d bytes)",
+				fileID, chunkIndex, remoteAddr, dataLength)
+
+			// Mark that we're expecting data for this request
+			dataBuffersMu.Lock()
+			expectingData[requestID] = true
+			dataBuffersMu.Unlock()
+
+		} else if len(expectingData) > 0 && !strings.Contains(message, ":") {
+			// This might be raw chunk data (payload following a DATA_RESP header)
+			dataBuffersMu.Lock()
+
+			// Try to match this data with pending requests
+			var matchedRequestID string
+
+			for reqID := range expectingData {
+				// Just take the first waiting request - this is a simplification
+				matchedRequestID = reqID
+				break
+			}
+
+			if matchedRequestID != "" {
+				// Store this data
+				delete(expectingData, matchedRequestID)
+
+				// Find the handler for this response
+				handlerObj, exists := t.udpResponseHandlers.Load(matchedRequestID)
+				if exists {
+					if handler, ok := handlerObj.(func([]byte, error)); ok {
+						// Call the handler with the data (on a new goroutine to avoid blocking)
+						go handler(data, nil)
+
+						// Clean up after successful response
+						t.udpResponseHandlers.Delete(matchedRequestID)
+						t.udpRequestsMu.Lock()
+						delete(t.udpRequests, matchedRequestID)
+						t.udpRequestsMu.Unlock()
+
+						log.Printf("Processed raw data packet (%d bytes) for request %s",
+							len(data), matchedRequestID)
 					}
 				}
-			}
-
-			if headerEnd == 0 || headerEnd >= len(message) {
-				log.Printf("Invalid DATA_RESP format from %s", remoteAddr)
-				continue
-			}
-
-			headerPart := message[0:headerEnd]
-			parts := strings.Split(headerPart, ":")
-
-			if len(parts) < 4 {
-				log.Printf("Invalid DATA_RESP header from %s: %s", remoteAddr, headerPart)
-				continue
-			}
-
-			requestID := parts[1]
-			fileID := parts[2]
-			chunkIndex, err := strconv.Atoi(parts[3])
-			if err != nil {
-				log.Printf("Invalid chunk index in DATA_RESP from %s: %s", remoteAddr, parts[3])
-				continue
-			}
-
-			// Extract the data part (everything after the header)
-			chunkData := data[headerEnd:]
-
-			log.Printf("Received UDP data response for file %s chunk %d from %s (%d bytes)",
-				fileID, chunkIndex, remoteAddr, len(chunkData))
-
-			// Look up the handler for this response
-			handlerObj, exists := t.udpResponseHandlers.Load(requestID)
-			if !exists {
-				log.Printf("No handler found for UDP response with ID %s", requestID)
-				continue
-			}
-
-			// Call the handler
-			if handler, ok := handlerObj.(func([]byte, error)); ok {
-				handler(chunkData, nil)
-
-				// Clean up after successful response
-				t.udpResponseHandlers.Delete(requestID)
-				t.udpRequestsMu.Lock()
-				delete(t.udpRequests, requestID)
-				t.udpRequestsMu.Unlock()
 			} else {
-				log.Printf("Invalid handler type for UDP response with ID %s", requestID)
+				log.Printf("Received unmatched data packet (%d bytes)", len(data))
 			}
+
+			dataBuffersMu.Unlock()
+
 		} else if strings.HasPrefix(message, "DATA_ERR:") {
 			// Handle error response: DATA_ERR:<requestID>:<fileID>:<chunkIndex>:<error message>
 			parts := strings.SplitN(strings.TrimPrefix(message, "DATA_ERR:"), ":", 4)

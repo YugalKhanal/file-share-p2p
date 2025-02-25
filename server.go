@@ -121,7 +121,7 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 	// Read chunk with retry logic
 	var chunkData []byte
 	var err error
-	for retries := range 3 {
+	for retries := 0; retries < 3; retries++ {
 		log.Printf("Reading chunk %d from file %s (attempt %d/3)",
 			chunkIndex, meta.OriginalPath, retries+1)
 
@@ -138,11 +138,7 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 		return nil, fmt.Errorf("failed to read chunk after retries: %v", err)
 	}
 
-	// Check if chunk is too large for UDP
-	if len(chunkData) > 63*1024 { // 63KB to be safe
-		return nil, fmt.Errorf("chunk too large for UDP: %d bytes", len(chunkData))
-	}
-
+	// Success path
 	log.Printf("Successfully read chunk %d (%d bytes) for UDP transfer",
 		chunkIndex, len(chunkData))
 	return chunkData, nil
