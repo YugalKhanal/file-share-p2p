@@ -429,10 +429,6 @@ func (t *UDPTransport) handleUDPMessages() {
 	log.Printf("Starting UDP message handler")
 	buf := make([]byte, 64*1024) // Large buffer for data chunks
 
-	// Track expected data messages
-	expectingData := make(map[string]bool)
-	var dataBuffersMu sync.Mutex
-
 	for {
 		n, remoteAddr, err := t.udpConn.ReadFromUDP(buf)
 		if err != nil {
