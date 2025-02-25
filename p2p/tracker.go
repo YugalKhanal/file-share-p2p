@@ -3,10 +3,9 @@ package p2p
 import (
 	// "context"
 	"encoding/json"
-	"fmt"
-	"github.com/huin/goupnp/dcps/internetgateway2"
 	"log"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -130,12 +129,7 @@ func (t *Tracker) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 
 // Helper function to check if a slice contains a string
 func contains(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, str)
 }
 
 func (t *Tracker) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -270,14 +264,13 @@ func (t *Tracker) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"files": files,
 		"total": len(files),
 		"page":  page,
 	})
 }
 
-// In tracker.go
 func (t *Tracker) HandleRemove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -399,54 +392,6 @@ func (t *Tracker) UpdatePeerActivity(peerAddr string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.peerLastSeen[peerAddr] = time.Now()
-}
-
-// SetupUPnP sets up port forwarding using UPnP
-func setupUPnP(port int) error {
-	clients, errors, err := internetgateway2.NewWANIPConnection1Clients()
-	if err != nil {
-		return fmt.Errorf("failed to discover UPnP clients: %v", err)
-	}
-
-	// Try each client until we succeed
-	for i, client := range clients {
-		if err := errors[i]; err != nil {
-			continue
-		}
-
-		// Get external IP
-		ip, err := client.GetExternalIPAddress()
-		if err != nil {
-			continue
-		}
-
-		// Add port mapping
-		// The correct order is:
-		// NewRemoteHost string
-		// NewExternalPort uint16
-		// NewProtocol string
-		// NewInternalPort uint16
-		// NewInternalClient string
-		// NewEnabled bool
-		// NewPortMappingDescription string
-		// NewLeaseDuration uint32
-		err = client.AddPortMapping(
-			"",                 // NewRemoteHost
-			uint16(port),       // NewExternalPort
-			"TCP",              // NewProtocol
-			uint16(port),       // NewInternalPort
-			ip,                 // NewInternalClient
-			true,               // NewEnabled
-			"ForeverStore P2P", // NewPortMappingDescription
-			3600,               // NewLeaseDuration
-		)
-		if err == nil {
-			log.Printf("Successfully mapped port %d via UPnP (External IP: %s)", port, ip)
-			return nil
-		}
-	}
-
-	return fmt.Errorf("failed to set up UPnP port mapping on port %d", port)
 }
 
 // HandleGetPeers handles requests by peers to get a list of peers for a file

@@ -42,6 +42,8 @@ type FileServer struct {
 	responseHandlers []func(p2p.Message)
 	activeFiles      map[string]*shared.Metadata // fileID -> metadata of actively shared files
 	activeFilesMu    sync.RWMutex
+	udpPeers         map[string]bool
+	udpPeersMu       sync.RWMutex
 }
 
 func makeServer(listenAddr, bootstrapNode string) *FileServer {
@@ -172,7 +174,90 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	maxRetries := 3
 	var lastErr error
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	// Try UDP peers first
+	s.udpPeersMu.RLock()
+	hasUDPPeers := len(s.udpPeers) > 0
+	udpPeers := make([]string, 0, len(s.udpPeers))
+	for peer := range s.udpPeers {
+		udpPeers = append(udpPeers, peer)
+	}
+	s.udpPeersMu.RUnlock()
+
+	if hasUDPPeers {
+		// Randomize the peer list for better load distribution
+		rand.Shuffle(len(udpPeers), func(i, j int) {
+			udpPeers[i], udpPeers[j] = udpPeers[j], udpPeers[i]
+		})
+
+		// Create a channel for receiving the UDP response
+		respChan := make(chan []byte, 1)
+		errChan := make(chan error, 1)
+
+		// Register a handler for UDP responses
+		transport, ok := s.opts.Transport.(*p2p.TCPTransport)
+		if ok {
+			// Use a unique request ID to track this specific request
+			requestID := fmt.Sprintf("%s-%d-%d", fileID, chunkIndex, time.Now().UnixNano())
+
+			// Setup a response handler
+			transport.RegisterUDPResponseHandler(requestID, func(data []byte, err error) {
+				if err != nil {
+					select {
+					case errChan <- err:
+					default:
+					}
+					return
+				}
+
+				select {
+				case respChan <- data:
+				default:
+				}
+			})
+
+			// Clean up when done
+			defer transport.UnregisterUDPResponseHandler(requestID)
+
+			// Try each UDP peer until success or all fail
+			for _, udpPeer := range udpPeers {
+				log.Printf("Requesting chunk %d via UDP from peer %s", chunkIndex, udpPeer)
+
+				// Send the request
+				err := transport.RequestUDPData(udpPeer, fileID, chunkIndex, requestID)
+				if err != nil {
+					log.Printf("Failed to send UDP request to %s: %v", udpPeer, err)
+					continue
+				}
+
+				// Wait for response with timeout
+				timeout := 10 * time.Second
+				select {
+				case data := <-respChan:
+					// Write data to file
+					if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
+						log.Printf("Failed to write UDP chunk data: %v", err)
+						continue
+					}
+
+					log.Printf("Successfully downloaded chunk %d via UDP", chunkIndex)
+					return nil
+
+				case err := <-errChan:
+					log.Printf("UDP download error: %v", err)
+					continue
+
+				case <-time.After(timeout):
+					log.Printf("UDP request timed out for peer %s", udpPeer)
+					continue
+				}
+			}
+
+			log.Printf("All UDP peers failed, falling back to TCP")
+		}
+	}
+
+	// Fall back to TCP peers if UDP failed or not available
+	for attempt := range maxRetries {
 		// Get current list of peers and shuffle them for load balancing
 		s.mu.RLock()
 		peers := make([]p2p.Peer, 0, len(s.peers))
@@ -318,7 +403,7 @@ func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int
 	}
 
 	// Write chunk with retry
-	for retries := 0; retries < 3; retries++ {
+	for retries := range 3 {
 		written, err := output.WriteAt(data, startOffset)
 		if err != nil {
 			if retries < 2 {
@@ -538,7 +623,6 @@ func (s *FileServer) onPeer(peer p2p.Peer) error {
 	return nil
 }
 
-// In server.go
 func (s *FileServer) ShareFile(filePath string) error {
 	fileID, err := s.generateFileID(filePath)
 	if err != nil {
@@ -613,7 +697,6 @@ func (s *FileServer) ShareFile(filePath string) error {
 	return nil
 }
 
-// In server.go
 func (s *FileServer) StopSeedingFile(fileID string) error {
 	s.activeFilesMu.Lock()
 	delete(s.activeFiles, fileID)
@@ -692,16 +775,6 @@ func (s *FileServer) generateFileID(filePath string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func (s *FileServer) logPeerState() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	log.Printf("Current peer state:")
-	for addr, peer := range s.peers {
-		log.Printf("  - Peer %s (remote addr: %s)", addr, peer.RemoteAddr())
-	}
-}
-
 func (s *FileServer) DownloadFile(fileID string) error {
 	log.Printf("Attempting to download file with ID: %s", fileID)
 
@@ -754,7 +827,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	s.mu.RLock()
 	for addr := range s.peers {
 		pieces := make([]int, meta.NumChunks)
-		for i := 0; i < meta.NumChunks; i++ {
+		for i := range meta.NumChunks {
 			pieces[i] = i
 		}
 		pieceManager.UpdatePeerPieces(addr, pieces)
@@ -930,150 +1003,6 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	return nil
 }
 
-func (s *FileServer) verifyDownloadedFile(filePath string, expectedHash string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to open downloaded file: %v", err)
-	}
-	defer file.Close()
-
-	hasher := sha1.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return fmt.Errorf("failed to calculate file hash: %v", err)
-	}
-
-	actualHash := hex.EncodeToString(hasher.Sum(nil))
-	if actualHash != expectedHash {
-		return fmt.Errorf("file verification failed: hash mismatch")
-	}
-
-	return nil
-}
-
-func (s *FileServer) handleMessage(peer p2p.Peer, msg *p2p.Message) error {
-	switch msg.Type {
-	case "chunk_request":
-		payload, ok := msg.Payload.(p2p.MessageChunkRequest)
-		if !ok {
-			return fmt.Errorf("invalid payload type for chunk_request")
-		}
-		return s.handleChunkRequest(peer, payload)
-	case "metadata_request":
-		payload, ok := msg.Payload.(p2p.MessageMetadataRequest)
-		if !ok {
-			return fmt.Errorf("invalid payload type for metadata_request")
-		}
-		return s.handleMetadataRequest(peer, payload)
-	default:
-		log.Printf("Received unknown message type %s from %s", msg.Type, peer.RemoteAddr())
-		return nil
-	}
-}
-
-func (s *FileServer) handleMetadataRequest(peer p2p.Peer, req p2p.MessageMetadataRequest) error {
-	log.Printf("Received metadata request for file ID %s from peer %s", req.FileID, peer.RemoteAddr())
-
-	// Load metadata
-	meta, err := s.store.GetMetadata(req.FileID)
-	if err != nil {
-		log.Printf("Metadata not found for file ID %s: %v", req.FileID, err)
-		return err
-	}
-
-	// Send metadata back to the requesting peer
-	resp := p2p.MessageMetadataResponse{Metadata: *meta}
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(resp); err != nil {
-		log.Printf("Failed to encode metadata response: %v", err)
-		return err
-	}
-
-	if _, err := peer.Write(buf.Bytes()); err != nil {
-		log.Printf("Failed to send metadata response to peer %s: %v", peer.RemoteAddr(), err)
-		return err
-	}
-
-	log.Printf("Sent metadata for file ID %s to peer %s", req.FileID, peer.RemoteAddr())
-	return nil
-}
-
-func (s *FileServer) getMetadataFromTracker(fileID string) (*shared.Metadata, error) {
-	url := fmt.Sprintf("%s/metadata?file_id=%s", s.opts.TrackerAddr, fileID)
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get metadata from tracker: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("tracker returned error: %s", string(body))
-	}
-
-	var fileInfo p2p.FileInfo // Updated to use p2p.FileInfo
-	if err := json.NewDecoder(resp.Body).Decode(&fileInfo); err != nil {
-		return nil, fmt.Errorf("failed to decode metadata: %v", err)
-	}
-
-	// Convert tracker's FileInfo to shared.Metadata
-	meta := &shared.Metadata{
-		FileID:        fileInfo.FileID,
-		NumChunks:     fileInfo.NumChunks,
-		ChunkSize:     fileInfo.ChunkSize,
-		FileExtension: fileInfo.Extension,
-		ChunkHashes:   fileInfo.ChunkHashes,
-		TotalHash:     fileInfo.TotalHash,
-		TotalSize:     fileInfo.TotalSize,
-	}
-
-	return meta, nil
-}
-
-// In server.go
-func (s *FileServer) startTrackerAnnouncements() {
-	if s.opts.TrackerAddr == "" {
-		return
-	}
-
-	// Get list of active files
-	s.activeFilesMu.RLock()
-	activeFiles := make([]string, 0, len(s.activeFiles))
-	for fileID := range s.activeFiles {
-		activeFiles = append(activeFiles, fileID)
-	}
-	s.activeFilesMu.RUnlock()
-
-	// Start periodic announcements for each file
-	for _, fileID := range activeFiles {
-		go func(id string) {
-			ticker := time.NewTicker(30 * time.Second) // Re-announce every 30 seconds
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					// Get the current metadata for this file
-					s.activeFilesMu.RLock()
-					meta, exists := s.activeFiles[id]
-					s.activeFilesMu.RUnlock()
-
-					if !exists {
-						log.Printf("File %s is no longer active, stopping announcements", id)
-						return
-					}
-
-					if err := announceToTracker(s.opts.TrackerAddr, id, s.opts.ListenAddr, meta); err != nil {
-						log.Printf("Failed to re-announce file %s: %v", id, err)
-					}
-				case <-s.quitch:
-					return
-				}
-			}
-		}(fileID)
-	}
-}
-
 func (s *FileServer) SetTrackerAddress(addr string) {
 	s.opts.TrackerAddr = addr
 }
@@ -1138,7 +1067,7 @@ func announceToTracker(trackerAddr string, fileID string, listenAddr string, met
 	backoff := time.Second
 
 	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := range maxRetries {
 		if attempt > 0 {
 			log.Printf("Retrying tracker announcement (attempt %d/%d) after %v",
 				attempt+1, maxRetries, backoff)

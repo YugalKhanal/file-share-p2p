@@ -75,25 +75,54 @@ type TCPTransportOpts struct {
 	HandshakeFunc HandshakeFunc
 	Decoder       Decoder
 	OnPeer        func(Peer) error
+	OnUDPPeer     func(string) error // Callback for UDP peers
 }
-
-// In tcp_transport.go
 
 type TCPTransport struct {
 	TCPTransportOpts
-	listener    net.Listener
-	udpConn     *net.UDPConn
-	rpcch       chan RPC
-	punchingMap sync.Map
-	connectedCh chan string
+	listener            net.Listener
+	udpConn             *net.UDPConn
+	rpcch               chan RPC
+	punchingMap         sync.Map
+	connectedCh         chan string
+	udpPeers            sync.Map // Map of addr string -> *net.UDPAddr
+	udpDataCh           chan UDPDataPacket
+	udpResponseHandlers sync.Map // Map of requestID -> handler function
+	udpRequestsMu       sync.Mutex
+	udpRequests         map[string]UDPRequest // Track active requests by requestID
+}
+
+type UDPDataPacket struct {
+	From       *net.UDPAddr
+	FileID     string
+	ChunkIndex int
+	Data       []byte
+	RequestID  string    // To match responses with requests
+	Timestamp  time.Time // For tracking timeouts
+}
+
+type UDPRequest struct {
+	FileID     string
+	ChunkIndex int
+	PeerAddr   *net.UDPAddr
+	Handler    func([]byte, error)
+	Timestamp  time.Time
+	Attempts   int
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
-	return &TCPTransport{
+	t := &TCPTransport{
 		TCPTransportOpts: opts,
 		rpcch:            make(chan RPC, 1024),
 		connectedCh:      make(chan string, 1),
+		udpDataCh:        make(chan UDPDataPacket, 100),
+		udpRequests:      make(map[string]UDPRequest),
 	}
+
+	// Start the UDP request timeout checker
+	go t.StartUDPRequestTimeoutChecker()
+
+	return t
 }
 
 // Addr implements the Transport interface return the address
@@ -119,11 +148,15 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 
 // Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
+	// Initialize UDP listener if not already done
 	if t.udpConn == nil {
 		log.Printf("Initializing UDP listener for hole punching")
 		if err := t.setupUDPListener(); err != nil {
 			return fmt.Errorf("UDP setup failed: %v", err)
 		}
+
+		// Initialize UDP data channel
+		t.udpDataCh = make(chan UDPDataPacket, 100)
 	}
 
 	addrs := strings.Split(addr, "|")
@@ -195,19 +228,35 @@ func (t *TCPTransport) Dial(addr string) error {
 	case <-doneCh:
 		log.Printf("Connection established via direct TCP")
 		return nil
-	case tcpAddr := <-t.connectedCh:
-		log.Printf("Connection established via hole punching to %s", tcpAddr)
+	case peerAddr := <-t.connectedCh:
+		log.Printf("Connection established via UDP hole punching to %s", peerAddr)
 
-		go func(addr string) {
-			time.Sleep(200 * time.Millisecond) // Brief pause to let the other side prepare
-			log.Printf("Attempting TCP connection after ACK to %s", addr)
-			if conn, err := net.DialTimeout("tcp", addr, 5*time.Second); err == nil {
-				log.Printf("Successfully established TCP connection after ACK to %s", addr)
-				go t.handleConn(conn, true)
-			} else {
-				log.Printf("Failed to establish TCP connection after ACK to %s: %v", addr, err)
-			}
-		}(tcpAddr)
+		// Store this peer address for future UDP communication
+		// (This would be a full address string with host and port)
+		host, portStr, err := net.SplitHostPort(peerAddr)
+		if err != nil {
+			log.Printf("Invalid peer address from ACK: %s", peerAddr)
+			return fmt.Errorf("invalid address from ACK: %s", peerAddr)
+		}
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			log.Printf("Invalid port in peer address: %s", peerAddr)
+			return fmt.Errorf("invalid port in peer address: %s", peerAddr)
+		}
+
+		// Create UDP address and store it
+		udpPeerAddr := &net.UDPAddr{
+			IP:   net.ParseIP(host),
+			Port: port,
+		}
+
+		t.udpPeers.Store(peerAddr, udpPeerAddr)
+
+		// Notify that UDP connection is available
+		if t.OnUDPPeer != nil {
+			t.OnUDPPeer(peerAddr)
+		}
 
 		return nil
 	case err := <-errCh:
