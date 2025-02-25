@@ -10,68 +10,6 @@ import (
 	"time"
 )
 
-// RequestUDPData sends a data request over UDP
-func (t *TCPTransport) RequestUDPData(peerAddr, fileID string, chunkIndex int, requestID string) error {
-	// Get the UDPAddr for this peer
-	addrObj, ok := t.udpPeers.Load(peerAddr)
-	if !ok {
-		log.Printf("Warning: UDP peer %s not found in peer map", peerAddr)
-		// Try to extract address and port
-		host, portStr, err := net.SplitHostPort(peerAddr)
-		if err != nil {
-			return fmt.Errorf("invalid peer address format: %s", peerAddr)
-		}
-
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return fmt.Errorf("invalid port in peer address: %s", peerAddr)
-		}
-
-		// Create UDP address
-		udpAddr := &net.UDPAddr{
-			IP:   net.ParseIP(host),
-			Port: port,
-		}
-
-		// Store for future use
-		t.udpPeers.Store(peerAddr, udpAddr)
-
-		addrObj = udpAddr
-		log.Printf("Created new UDP address for peer: %s", udpAddr)
-	}
-
-	udpAddr, ok := addrObj.(*net.UDPAddr)
-	if !ok {
-		return fmt.Errorf("invalid UDP peer address type for %s", peerAddr)
-	}
-
-	// Create request message
-	// Format: DATA_REQ:<requestID>:<fileID>:<chunkIndex>
-	reqMsg := fmt.Sprintf("DATA_REQ:%s:%s:%d", requestID, fileID, chunkIndex)
-
-	// Send the request
-	n, err := t.udpConn.WriteToUDP([]byte(reqMsg), udpAddr)
-	if err != nil {
-		return fmt.Errorf("failed to send UDP data request: %v", err)
-	}
-
-	log.Printf("Sent UDP data request for file %s chunk %d to %s (requestID: %s, bytes: %d)",
-		fileID, chunkIndex, udpAddr, requestID, n)
-
-	// Track this request
-	t.udpRequestsMu.Lock()
-	t.udpRequests[requestID] = UDPRequest{
-		FileID:     fileID,
-		ChunkIndex: chunkIndex,
-		PeerAddr:   udpAddr,
-		Timestamp:  time.Now(),
-		Attempts:   1,
-	}
-	t.udpRequestsMu.Unlock()
-
-	return nil
-}
-
 // RegisterUDPResponseHandler registers a handler for UDP responses
 func (t *TCPTransport) RegisterUDPResponseHandler(requestID string, handler func([]byte, error)) {
 	t.udpResponseHandlers.Store(requestID, handler)
@@ -162,11 +100,97 @@ func (t *TCPTransport) setupUDPDataChannel(remoteAddr *net.UDPAddr) {
 	}
 }
 
+// RequestUDPData sends a data request over UDP
+func (t *TCPTransport) RequestUDPData(peerAddr, fileID string, chunkIndex int, requestID string) error {
+	log.Printf("Entering RequestUDPData for peer %s, file %s, chunk %d, requestID %s",
+		peerAddr, fileID, chunkIndex, requestID)
+
+	// Get the UDPAddr for this peer
+	addrObj, ok := t.udpPeers.Load(peerAddr)
+	if !ok {
+		log.Printf("Warning: UDP peer %s not found in peer map", peerAddr)
+		// Try to extract address and port
+		host, portStr, err := net.SplitHostPort(peerAddr)
+		if err != nil {
+			return fmt.Errorf("invalid peer address format: %s", peerAddr)
+		}
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return fmt.Errorf("invalid port in peer address: %s", peerAddr)
+		}
+
+		// Create UDP address
+		udpAddr := &net.UDPAddr{
+			IP:   net.ParseIP(host),
+			Port: port,
+		}
+
+		// Store for future use
+		t.udpPeers.Store(peerAddr, udpAddr)
+
+		addrObj = udpAddr
+		log.Printf("Created new UDP address for peer: %s", udpAddr)
+	}
+
+	udpAddr, ok := addrObj.(*net.UDPAddr)
+	if !ok {
+		return fmt.Errorf("invalid UDP peer address type for %s", peerAddr)
+	}
+
+	// Create request message
+	// Format: DATA_REQ:<requestID>:<fileID>:<chunkIndex>
+	reqMsg := fmt.Sprintf("DATA_REQ:%s:%s:%d", requestID, fileID, chunkIndex)
+	log.Printf("Sending UDP request message: %s to %s", reqMsg, udpAddr)
+
+	// Send the request
+	n, err := t.udpConn.WriteToUDP([]byte(reqMsg), udpAddr)
+	if err != nil {
+		return fmt.Errorf("failed to send UDP data request: %v", err)
+	}
+
+	log.Printf("Sent UDP data request for file %s chunk %d to %s (requestID: %s, bytes: %d)",
+		fileID, chunkIndex, udpAddr, requestID, n)
+
+	// Track this request
+	t.udpRequestsMu.Lock()
+	t.udpRequests[requestID] = UDPRequest{
+		FileID:     fileID,
+		ChunkIndex: chunkIndex,
+		PeerAddr:   udpAddr,
+		Handler:    t.getResponseHandler(requestID),
+		Timestamp:  time.Now(),
+		Attempts:   1,
+	}
+	t.udpRequestsMu.Unlock()
+
+	return nil
+}
+
+// New helper function to get the response handler
+func (t *TCPTransport) getResponseHandler(requestID string) func([]byte, error) {
+	value, exists := t.udpResponseHandlers.Load(requestID)
+	if !exists {
+		log.Printf("Warning: No response handler found for request ID %s", requestID)
+		return nil
+	}
+
+	handler, ok := value.(func([]byte, error))
+	if !ok {
+		log.Printf("Warning: Invalid handler type for request ID %s", requestID)
+		return nil
+	}
+
+	return handler
+}
+
+// Handle UDP data request
 func (t *TCPTransport) handleUDPDataRequest(remoteAddr *net.UDPAddr, fileID string, chunkIndex int, requestID string) {
 	log.Printf("Received UDP data request for file %s chunk %d from %s (requestID: %s)",
 		fileID, chunkIndex, remoteAddr, requestID)
 
 	if t.OnUDPDataRequest != nil {
+		log.Printf("Calling OnUDPDataRequest callback to get chunk data")
 		chunkData, err := t.OnUDPDataRequest(fileID, chunkIndex)
 		if err != nil {
 			log.Printf("Failed to fetch chunk data: %v", err)
@@ -176,69 +200,32 @@ func (t *TCPTransport) handleUDPDataRequest(remoteAddr *net.UDPAddr, fileID stri
 			return
 		}
 
-		// Create message header
-		header := fmt.Sprintf("DATA_RESP:%s:%s:%d:", requestID, fileID, chunkIndex)
-		headerBytes := []byte(header)
+		log.Printf("Successfully got chunk data: %d bytes", len(chunkData))
 
-		// Calculate total message size
-		totalSize := len(headerBytes) + len(chunkData)
+		// Send data response
+		dataResp := fmt.Sprintf("DATA_RESP:%s:%s:%d:", requestID, fileID, chunkIndex)
+		log.Printf("Sending data response header: %s", dataResp)
 
-		// Check if we need to split the message
-		if totalSize <= 65507 { // Max UDP packet size
-			// Create combined message
-			message := make([]byte, totalSize)
-			copy(message, headerBytes)
-			copy(message[len(headerBytes):], chunkData)
+		// Combine header and data
+		fullMsg := make([]byte, len(dataResp)+len(chunkData))
+		copy(fullMsg, []byte(dataResp))
+		copy(fullMsg[len(dataResp):], chunkData)
 
-			// Send in a single packet
-			_, err = t.udpConn.WriteToUDP(message, remoteAddr)
+		// Send in a single packet if possible
+		if len(fullMsg) <= 65507 { // Max UDP packet size
+			_, err = t.udpConn.WriteToUDP(fullMsg, remoteAddr)
 			if err != nil {
 				log.Printf("Failed to send UDP data response: %v", err)
 			} else {
-				log.Printf("Successfully sent chunk %d (%d bytes) via UDP in single packet",
-					chunkIndex, totalSize)
+				log.Printf("Successfully sent chunk %d (%d bytes) via UDP",
+					chunkIndex, len(fullMsg))
 			}
 		} else {
-			// Need to split into multiple packets
-			// First send the header with size information
-			sizeHeader := fmt.Sprintf("%s%d:", header, len(chunkData))
-			_, err = t.udpConn.WriteToUDP([]byte(sizeHeader), remoteAddr)
-			if err != nil {
-				log.Printf("Failed to send UDP data response header: %v", err)
-				return
-			}
-
-			// Send the data in chunks
-			const maxChunkSize = 65000
-			for offset := 0; offset < len(chunkData); offset += maxChunkSize {
-				end := offset + maxChunkSize
-				if end > len(chunkData) {
-					end = len(chunkData)
-				}
-
-				chunkPart := chunkData[offset:end]
-				partHeader := fmt.Sprintf("PART:%s:%d:%d:", requestID, offset, len(chunkPart))
-
-				partMessage := make([]byte, len(partHeader)+len(chunkPart))
-				copy(partMessage, []byte(partHeader))
-				copy(partMessage[len(partHeader):], chunkPart)
-
-				_, err = t.udpConn.WriteToUDP(partMessage, remoteAddr)
-				if err != nil {
-					log.Printf("Failed to send UDP data part: %v", err)
-					return
-				}
-
-				// Small delay to prevent overwhelming the network
-				time.Sleep(5 * time.Millisecond)
-			}
-
-			// Send completion message
-			completionMsg := fmt.Sprintf("COMPLETE:%s", requestID)
-			t.udpConn.WriteToUDP([]byte(completionMsg), remoteAddr)
-
-			log.Printf("Successfully sent chunk %d (%d bytes) via UDP in multiple packets",
-				chunkIndex, len(chunkData))
+			// For large responses, implement chunking
+			log.Printf("Data too large for single UDP packet, would need to implement chunking")
+			// For now, send an error
+			errMsg := fmt.Sprintf("ERROR_RESP:%s:data_too_large", requestID)
+			t.udpConn.WriteToUDP([]byte(errMsg), remoteAddr)
 		}
 	} else {
 		log.Printf("Cannot handle UDP data request: no data request handler registered")

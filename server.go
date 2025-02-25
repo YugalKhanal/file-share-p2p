@@ -81,6 +81,8 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 }
 
 func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte, error) {
+	log.Printf("FileServer.handleUDPDataRequest called for file %s, chunk %d", fileID, chunkIndex)
+
 	// First check if we're actively seeding this file
 	s.activeFilesMu.RLock()
 	meta, isActive := s.activeFiles[fileID]
@@ -90,8 +92,7 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 		return nil, fmt.Errorf("file %s is not being actively seeded", fileID)
 	}
 
-	log.Printf("Handling UDP data request for file %s chunk %d, metadata: %+v",
-		fileID, chunkIndex, meta)
+	log.Printf("File is actively being seeded, metadata: %+v", meta)
 
 	if chunkIndex >= meta.NumChunks {
 		return nil, fmt.Errorf("invalid chunk index %d, file only has %d chunks",
@@ -101,9 +102,13 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 	// Read chunk with retry logic
 	var chunkData []byte
 	var err error
-	for retries := range 3 {
+	for retries := 0; retries < 3; retries++ {
+		log.Printf("Reading chunk %d from file %s (attempt %d/3)",
+			chunkIndex, meta.OriginalPath, retries+1)
+
 		chunkData, err = s.store.ReadChunk(meta.OriginalPath, chunkIndex)
 		if err == nil {
+			log.Printf("Successfully read chunk %d: %d bytes", chunkIndex, len(chunkData))
 			break
 		}
 		log.Printf("Error reading chunk (attempt %d/3): %v", retries+1, err)
@@ -114,7 +119,8 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 		return nil, fmt.Errorf("failed to read chunk after retries: %v", err)
 	}
 
-	log.Printf("Successfully read chunk %d (%d bytes) for UDP transfer", chunkIndex, len(chunkData))
+	log.Printf("Successfully read chunk %d (%d bytes) for UDP transfer",
+		chunkIndex, len(chunkData))
 	return chunkData, nil
 }
 
@@ -213,6 +219,9 @@ func (s *FileServer) consumeRPCMessages() {
 }
 
 func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, outputFile *os.File) error {
+	// At the beginning of the method
+	log.Printf("Starting download for chunk %d of file %s", chunkIndex, fileID)
+
 	// Track retry attempts per piece
 	maxRetries := 3
 	var lastErr error
@@ -229,46 +238,28 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	s.udpPeersMu.RUnlock()
 
 	if hasUDPPeers {
-		// Randomize the peer list for better load distribution
-		rand.Shuffle(len(udpPeers), func(i, j int) {
-			udpPeers[i], udpPeers[j] = udpPeers[j], udpPeers[i]
-		})
-
-		// Create channels for receiving the UDP response
+		// Create a channel for receiving the UDP response
 		respChan := make(chan []byte, 1)
 		errChan := make(chan error, 1)
-		doneChan := make(chan struct{})
 
-		defer close(doneChan)
-
-		// Get transport
+		// Register a handler for UDP responses
 		transport, ok := s.opts.Transport.(*p2p.TCPTransport)
 		if ok {
+			log.Printf("Got TCPTransport for UDP data request")
 			// Use a unique request ID to track this specific request
 			requestID := fmt.Sprintf("%s-%d-%d", fileID, chunkIndex, time.Now().UnixNano())
+			log.Printf("Generated request ID: %s", requestID)
 
 			// Setup a response handler with better logging
 			transport.RegisterUDPResponseHandler(requestID, func(data []byte, err error) {
-				select {
-				case <-doneChan:
-					return
-				default:
-				}
-
+				log.Printf("UDP response handler called for request %s", requestID)
 				if err != nil {
 					log.Printf("UDP download error: %v", err)
 					select {
 					case errChan <- err:
+						log.Printf("Sent error to error channel")
 					default:
-					}
-					return
-				}
-
-				if data == nil || len(data) == 0 {
-					log.Printf("Warning: Received empty UDP data response")
-					select {
-					case errChan <- fmt.Errorf("empty data received"):
-					default:
+						log.Printf("Error channel full, couldn't send error")
 					}
 					return
 				}
@@ -276,6 +267,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 				log.Printf("Received UDP chunk data response: %d bytes", len(data))
 				select {
 				case respChan <- data:
+					log.Printf("Sent data to response channel")
 				default:
 					log.Printf("Warning: Response channel is full")
 				}
@@ -298,7 +290,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 				log.Printf("Successfully sent UDP request to %s", udpPeer)
 
 				// Wait for response with timeout
-				timeout := 20 * time.Second // Increased timeout
+				timeout := 10 * time.Second
 				select {
 				case data := <-respChan:
 					log.Printf("Received UDP data response: %d bytes", len(data))
@@ -323,6 +315,8 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			}
 
 			log.Printf("All UDP peers failed, falling back to TCP")
+		} else {
+			log.Printf("Error: Could not get TCPTransport for UDP data request")
 		}
 	}
 

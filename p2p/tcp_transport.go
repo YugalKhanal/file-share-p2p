@@ -117,7 +117,7 @@ func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
 	t := &TCPTransport{
 		TCPTransportOpts: opts,
 		rpcch:            make(chan RPC, 1024),
-		connectedCh:      make(chan string, 1),
+		connectedCh:      make(chan string, 10),
 		udpDataCh:        make(chan UDPDataPacket, 100),
 		udpRequests:      make(map[string]UDPRequest),
 	}
