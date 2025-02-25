@@ -39,7 +39,7 @@ func NewUDPTransport(listenAddr string) *UDPTransport {
 
 	// Use a UDP port that's offset from the TCP port
 	port, _ := strconv.Atoi(portStr)
-	udpPort := port + 2 // Change +1 to +2 here to be consistent
+	udpPort := port + 4 // Change this to +4 to be consistent
 	udpListenAddr := fmt.Sprintf(":%d", udpPort)
 
 	t := &UDPTransport{
