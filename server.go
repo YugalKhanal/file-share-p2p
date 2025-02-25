@@ -46,6 +46,7 @@ type FileServer struct {
 	udpPeersMu       sync.RWMutex
 }
 
+// In server.go, update makeServer function
 func makeServer(listenAddr, bootstrapNode string) *FileServer {
 	tcpOpts := p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
@@ -53,13 +54,18 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 		Decoder:       p2p.DefaultDecoder{},
 	}
 
-	transport := p2p.NewTCPTransport(tcpOpts)
+	// Create both TCP and UDP transports
+	tcpTransport := p2p.NewTCPTransport(tcpOpts)
+	udpTransport := p2p.NewUDPTransport(listenAddr)
+
+	// Create combined transport manager
+	transportManager := NewTransportManager(tcpTransport, udpTransport)
 
 	opts := FileServerOpts{
 		ListenAddr:        listenAddr,
 		StorageRoot:       "shared_files",
 		PathTransformFunc: DefaultPathTransformFunc,
-		Transport:         transport,
+		Transport:         transportManager,
 		BootstrapNodes:    []string{bootstrapNode},
 	}
 
@@ -73,9 +79,11 @@ func makeServer(listenAddr, bootstrapNode string) *FileServer {
 		udpPeers:      make(map[string]bool),
 	}
 
-	transport.SetOnPeer(server.onPeer)
-	transport.OnUDPPeer = server.onUDPPeer
-	transport.OnUDPDataRequest = server.handleUDPDataRequest
+	// Set callbacks for both transports
+	tcpTransport.SetOnPeer(server.onPeer)
+	udpTransport.SetOnPeer(server.onPeer)
+	udpTransport.OnUDPPeer = server.onUDPPeer
+	udpTransport.OnUDPDataRequest = server.handleUDPDataRequest
 
 	return server
 }
@@ -102,7 +110,7 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 	// Read chunk with retry logic
 	var chunkData []byte
 	var err error
-	for retries := 0; retries < 3; retries++ {
+	for retries := range 3 {
 		log.Printf("Reading chunk %d from file %s (attempt %d/3)",
 			chunkIndex, meta.OriginalPath, retries+1)
 

@@ -150,139 +150,66 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 }
 
 // Dial implements the Transport interface.
+// Dial implements the Transport interface for TCPTransport
 func (t *TCPTransport) Dial(addr string) error {
-	// Initialize UDP listener if not already done
-	if t.udpConn == nil {
-		log.Printf("Initializing UDP listener for hole punching")
-		if err := t.setupUDPListener(); err != nil {
-			return fmt.Errorf("UDP setup failed: %v", err)
-		}
-
-		// Initialize UDP data channel
-		t.udpDataCh = make(chan UDPDataPacket, 100)
-	}
-
 	addrs := strings.Split(addr, "|")
-	log.Printf("Attempting to connect to addresses: %v", addrs)
+	log.Printf("Attempting TCP connections to addresses: %v", addrs)
 
-	errCh := make(chan error, len(addrs))
-	doneCh := make(chan struct{})
-
+	// Try each address in the list
+	var lastErr error
 	for _, address := range addrs {
-		go func(targetAddr string) {
-			host, portStr, err := net.SplitHostPort(targetAddr)
-			if err != nil {
-				errCh <- fmt.Errorf("invalid address %s: %v", targetAddr, err)
-				return
-			}
+		// Skip invalid addresses
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			lastErr = fmt.Errorf("invalid address %s: %v", address, err)
+			continue
+		}
 
-			port, err := strconv.Atoi(portStr)
-			if err != nil {
-				errCh <- fmt.Errorf("invalid port in address %s: %v", targetAddr, err)
-				return
-			}
+		// Check if this is our own address
+		if t.isSelfAddress(host, portStr) {
+			log.Printf("Skipping own address: %s", address)
+			continue
+		}
 
-			// Create UDP address using the same port as the TCP service
-			udpAddr := &net.UDPAddr{
-				IP:   net.ParseIP(host),
-				Port: port, // Use the port from the target address
-			}
+		log.Printf("Attempting direct TCP connection to %s", address)
+		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+		if err != nil {
+			log.Printf("TCP connection failed to %s: %v", address, err)
+			lastErr = err
+			continue
+		}
 
-			// Ensure the listen address is properly formatted with a host
-			listenPort := t.getPort()
-
-			// Create a properly formatted PUNCH message
-			publicIP, err := shared.GetPublicIP()
-			if err != nil {
-				log.Printf("Warning: Failed to get public IP: %v", err)
-				// Fallback to local IP if public can't be determined
-				publicIP, err = shared.GetLocalIP()
-				if err != nil {
-					log.Printf("cannot determine IP address: %v", err)
-					return
-				}
-			}
-
-			// Create a PUNCH message with the public IP
-			punchMsg := fmt.Sprintf("PUNCH:%s:%d", publicIP, listenPort)
-			log.Printf("Starting hole punching to %s (UDP: %s) with message: %s",
-				targetAddr, udpAddr, punchMsg)
-			log.Printf("Starting hole punching to %s (UDP: %s) with message: %s",
-				targetAddr, udpAddr, punchMsg)
-
-			// Send punch messages with exponential backoff
-			for i := range 5 {
-				n, err := t.udpConn.WriteToUDP([]byte(punchMsg), udpAddr)
-				if err != nil {
-					log.Printf("Failed to send punch message to %s: %v", udpAddr, err)
-				} else {
-					log.Printf("Sent punch message to %s (%d bytes)", udpAddr, n)
-				}
-
-				// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
-				backoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
-				time.Sleep(backoff)
-			}
-
-			// Try direct TCP connection as fallback
-			log.Printf("Attempting direct TCP connection to %s", targetAddr)
-			if conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second); err == nil {
-				log.Printf("Direct TCP connection successful to %s", targetAddr)
-				go t.handleConn(conn, true)
-				close(doneCh)
-				return
-			} else {
-				log.Printf("Direct TCP connection failed to %s: %v", targetAddr, err)
-			}
-		}(address)
+		log.Printf("TCP connection successful to %s", address)
+		go t.handleConn(conn, true)
+		return nil
 	}
 
-	// Wait longer for hole punching to work
-	log.Printf("Waiting for connection success or timeout")
-	select {
-	case <-doneCh:
-		log.Printf("Connection established via direct TCP")
-		return nil
-	case peerAddr := <-t.connectedCh:
-		log.Printf("Connection established via UDP hole punching to %s", peerAddr)
+	return fmt.Errorf("all TCP connection attempts failed: %v", lastErr)
+}
 
-		// Store this peer address for future UDP communication
-		// (This would be a full address string with host and port)
-		host, portStr, err := net.SplitHostPort(peerAddr)
-		if err != nil {
-			log.Printf("Invalid peer address from ACK: %s", peerAddr)
-			return fmt.Errorf("invalid address from ACK: %s", peerAddr)
-		}
+// Helper method to check if an address is our own
+func (t *TCPTransport) isSelfAddress(host string, portStr string) bool {
+	// Get listen port
+	listenPort := t.getPort()
+	port, _ := strconv.Atoi(portStr)
 
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			log.Printf("Invalid port in peer address: %s", peerAddr)
-			return fmt.Errorf("invalid port in peer address: %s", peerAddr)
-		}
-
-		// Create UDP address and store it
-		udpPeerAddr := &net.UDPAddr{
-			IP:   net.ParseIP(host),
-			Port: port,
-		}
-
-		t.udpPeers.Store(peerAddr, udpPeerAddr)
-
-		// Notify that UDP connection is available
-		if t.OnUDPPeer != nil {
-			t.OnUDPPeer(peerAddr)
-		}
-
-		log.Printf("Notified FileServer about new UDP peer: %s", peerAddr)
-
-		return nil
-	case err := <-errCh:
-		log.Printf("Connection error: %v", err)
-		return err
-	case <-time.After(20 * time.Second): // Increased timeout
-		log.Printf("Connection attempt timed out")
-		return fmt.Errorf("connection timeout")
+	// Check if ports match
+	if port != listenPort {
+		return false
 	}
+
+	// Check localhost variations
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+
+	// Check local IP
+	localIP, err := shared.GetLocalIP()
+	if err == nil && host == localIP {
+		return true
+	}
+
+	return false
 }
 
 func (t *TCPTransport) getPort() int {
