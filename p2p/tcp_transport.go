@@ -294,17 +294,6 @@ func (t *TCPTransport) getPort() int {
 	return port
 }
 
-// formatTCPAddress formats the given IP and port as a TCP address string,
-// correctly handling both IPv4 and IPv6 addresses
-func formatTCPAddress(ip net.IP, port int) string {
-	if ip.To4() != nil {
-		// IPv4 address
-		return fmt.Sprintf("%s:%d", ip.String(), port)
-	}
-	// IPv6 address
-	return fmt.Sprintf("[%s]:%d", ip.String(), port)
-}
-
 func (t *TCPTransport) ListenAndAccept() error {
 	var err error
 	t.listener, err = net.Listen("tcp", t.ListenAddr)
