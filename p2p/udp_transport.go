@@ -35,7 +35,7 @@ func NewUDPTransport(listenAddr string) *UDPTransport {
 	t := &UDPTransport{
 		ListenAddr:  listenAddr,
 		rpcch:       make(chan RPC, 1024),
-		connectedCh: make(chan string, 1),
+		connectedCh: make(chan string, 10),
 		udpDataCh:   make(chan UDPDataPacket, 100),
 		udpRequests: make(map[string]UDPRequest),
 	}
@@ -417,12 +417,22 @@ func (t *UDPTransport) handleUDPMessages() {
 		copy(data, buf[:n])
 		message := string(data)
 
-		log.Printf("Received UDP message from %s: %s", remoteAddr, message[:min(50, len(message))])
+		// Only log the first part of the message to avoid huge logs for data responses
+		messagePreview := message
+		if len(messagePreview) > 60 {
+			messagePreview = messagePreview[:60] + "..." // Truncate for logging
+		}
+		log.Printf("Received UDP message from %s: %s", remoteAddr, messagePreview)
 
 		// Handle different message types
 		if strings.HasPrefix(message, "PUNCH:") {
-			// Extract the sender's address
-			senderAddr := strings.TrimPrefix(message, "PUNCH:")
+			// Extract the sender's address from the punch message
+			parts := strings.SplitN(message, ":", 2)
+			if len(parts) != 2 {
+				log.Printf("Invalid PUNCH format from %s: %s", remoteAddr, message)
+				continue
+			}
+			senderAddr := parts[1]
 			log.Printf("Received PUNCH message from %s, sending ACK to %s",
 				remoteAddr, senderAddr)
 
@@ -442,8 +452,13 @@ func (t *UDPTransport) handleUDPMessages() {
 			}
 
 		} else if strings.HasPrefix(message, "ACK:") {
-			// Extract the sender's address
-			senderAddr := strings.TrimPrefix(message, "ACK:")
+			// Extract the sender's address from the ACK
+			parts := strings.SplitN(message, ":", 2)
+			if len(parts) != 2 {
+				log.Printf("Invalid ACK format from %s: %s", remoteAddr, message)
+				continue
+			}
+			senderAddr := parts[1]
 			log.Printf("Received ACK from %s for hole punching", senderAddr)
 
 			// Signal the Dial method that connection was successful
@@ -481,32 +496,31 @@ func (t *UDPTransport) handleUDPMessages() {
 
 		} else if strings.HasPrefix(message, "DATA_RESP:") {
 			// Handle data response: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<data>
-			// Find the 4th colon (after the "DATA_RESP:" prefix)
+			// Find the position of the 4th colon (after the "DATA_RESP:" prefix)
 			prefixLen := len("DATA_RESP:")
-			rest := message[prefixLen:]
-
-			// Find the position of the third colon in the rest of the string
 			colonCount := 0
 			headerEnd := 0
-			for i, ch := range rest {
-				if ch == ':' {
+
+			for i := prefixLen; i < len(message); i++ {
+				if message[i] == ':' {
 					colonCount++
 					if colonCount == 3 {
-						headerEnd = prefixLen + i + 1
+						headerEnd = i + 1
 						break
 					}
 				}
 			}
 
-			if headerEnd == 0 {
+			if headerEnd == 0 || headerEnd >= len(message) {
 				log.Printf("Invalid DATA_RESP format from %s", remoteAddr)
 				continue
 			}
 
-			header := message[:headerEnd-1]
-			parts := strings.Split(header, ":")
-			if len(parts) != 4 {
-				log.Printf("Invalid DATA_RESP header from %s: %s", remoteAddr, header)
+			headerPart := message[0:headerEnd]
+			parts := strings.Split(headerPart, ":")
+
+			if len(parts) < 4 {
+				log.Printf("Invalid DATA_RESP header from %s: %s", remoteAddr, headerPart)
 				continue
 			}
 
@@ -519,10 +533,10 @@ func (t *UDPTransport) handleUDPMessages() {
 			}
 
 			// Extract the data part (everything after the header)
-			data := buf[headerEnd:n]
+			chunkData := data[headerEnd:]
 
 			log.Printf("Received UDP data response for file %s chunk %d from %s (%d bytes)",
-				fileID, chunkIndex, remoteAddr, len(data))
+				fileID, chunkIndex, remoteAddr, len(chunkData))
 
 			// Look up the handler for this response
 			handlerObj, exists := t.udpResponseHandlers.Load(requestID)
@@ -533,7 +547,7 @@ func (t *UDPTransport) handleUDPMessages() {
 
 			// Call the handler
 			if handler, ok := handlerObj.(func([]byte, error)); ok {
-				handler(data, nil)
+				handler(chunkData, nil)
 
 				// Clean up after successful response
 				t.udpResponseHandlers.Delete(requestID)
@@ -543,8 +557,42 @@ func (t *UDPTransport) handleUDPMessages() {
 			} else {
 				log.Printf("Invalid handler type for UDP response with ID %s", requestID)
 			}
+		} else if strings.HasPrefix(message, "DATA_ERR:") {
+			// Handle error response: DATA_ERR:<requestID>:<fileID>:<chunkIndex>:<error message>
+			parts := strings.SplitN(strings.TrimPrefix(message, "DATA_ERR:"), ":", 4)
+			if len(parts) != 4 {
+				log.Printf("Invalid DATA_ERR format from %s: %s", remoteAddr, message)
+				continue
+			}
+
+			requestID := parts[0]
+			fileID := parts[1]
+			errorMsg := parts[3]
+
+			log.Printf("Received UDP error response for file %s from %s: %s",
+				fileID, remoteAddr, errorMsg)
+
+			// Look up the handler for this response
+			handlerObj, exists := t.udpResponseHandlers.Load(requestID)
+			if !exists {
+				log.Printf("No handler found for UDP error with ID %s", requestID)
+				continue
+			}
+
+			// Call the handler with the error
+			if handler, ok := handlerObj.(func([]byte, error)); ok {
+				handler(nil, fmt.Errorf("%s", errorMsg))
+
+				// Clean up after error response
+				t.udpResponseHandlers.Delete(requestID)
+				t.udpRequestsMu.Lock()
+				delete(t.udpRequests, requestID)
+				t.udpRequestsMu.Unlock()
+			} else {
+				log.Printf("Invalid handler type for UDP error with ID %s", requestID)
+			}
 		} else {
-			log.Printf("Received unknown UDP message type from %s: %s", remoteAddr, message)
+			log.Printf("Received unknown UDP message type from %s: %s", remoteAddr, messagePreview)
 		}
 	}
 }

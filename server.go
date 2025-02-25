@@ -138,6 +138,11 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 		return nil, fmt.Errorf("failed to read chunk after retries: %v", err)
 	}
 
+	// Check if chunk is too large for UDP
+	if len(chunkData) > 63*1024 { // 63KB to be safe
+		return nil, fmt.Errorf("chunk too large for UDP: %d bytes", len(chunkData))
+	}
+
 	log.Printf("Successfully read chunk %d (%d bytes) for UDP transfer",
 		chunkIndex, len(chunkData))
 	return chunkData, nil
@@ -497,11 +502,15 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 }
 
 func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int) error {
+	if data == nil || len(data) == 0 {
+		return fmt.Errorf("empty chunk data")
+	}
+
 	startOffset := int64(chunkIndex * chunkSize)
 
 	// Verify chunk size
 	if len(data) > chunkSize {
-		return fmt.Errorf("oversized chunk data")
+		return fmt.Errorf("oversized chunk data: %d bytes, max allowed: %d", len(data), chunkSize)
 	}
 
 	// Write chunk with retry
@@ -520,6 +529,28 @@ func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int
 				continue
 			}
 			return fmt.Errorf("incomplete write: %d of %d bytes", written, len(data))
+		}
+
+		// If we get here, verify the written data by reading it back
+		if retries == 0 {
+			verifyBuf := make([]byte, len(data))
+			_, readErr := output.ReadAt(verifyBuf, startOffset)
+			if readErr != nil {
+				if retries < 2 {
+					time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
+					continue
+				}
+				return fmt.Errorf("verification read error: %v", readErr)
+			}
+
+			// Compare written and read data
+			if !bytes.Equal(data, verifyBuf) {
+				if retries < 2 {
+					time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
+					continue
+				}
+				return fmt.Errorf("data verification failed")
+			}
 		}
 
 		return nil
@@ -949,7 +980,7 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	}
 
 	// Wait a moment for UDP connections to be fully established
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	// Log UDP peer counts
 	s.udpPeersMu.RLock()
@@ -973,6 +1004,17 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	}
 	s.mu.RUnlock()
 
+	// Also add UDP peers to the piece manager
+	s.udpPeersMu.RLock()
+	for addr := range s.udpPeers {
+		pieces := make([]int, meta.NumChunks)
+		for i := range meta.NumChunks {
+			pieces[i] = i
+		}
+		pieceManager.UpdatePeerPieces(addr, pieces)
+	}
+	s.udpPeersMu.RUnlock()
+
 	outputFileName := fmt.Sprintf("downloaded_%s%s", fileID, meta.FileExtension)
 	outputFile, err := os.Create(outputFileName)
 	if err != nil {
@@ -985,6 +1027,13 @@ func (s *FileServer) DownloadFile(fileID string) error {
 			os.Remove(outputFileName)
 		}
 	}()
+
+	// Pre-allocate file size if total size is known
+	if meta.TotalSize > 0 {
+		if err := outputFile.Truncate(meta.TotalSize); err != nil {
+			log.Printf("Warning: Failed to pre-allocate file size: %v", err)
+		}
+	}
 
 	// Create semaphore to limit concurrent downloads
 	const maxConcurrent = 10
