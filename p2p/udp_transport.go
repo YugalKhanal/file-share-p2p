@@ -31,24 +31,17 @@ type UDPTransport struct {
 
 // NewUDPTransport creates a new UDPTransport
 func NewUDPTransport(listenAddr string) *UDPTransport {
-	// Parse the TCP address to get the port
-	_, portStr, err := net.SplitHostPort(listenAddr)
-	if err != nil {
-		portStr = "3000" // Default port if parsing fails
-	}
-
-	// Use a UDP port that's offset from the TCP port
-	port, _ := strconv.Atoi(portStr)
-	udpPort := port + 4 // Change this to +4 to be consistent
-	udpListenAddr := fmt.Sprintf(":%d", udpPort)
-
+	// Use the provided address directly, no offset
 	t := &UDPTransport{
-		ListenAddr:  udpListenAddr,
+		ListenAddr:  listenAddr,
 		rpcch:       make(chan RPC, 1024),
 		connectedCh: make(chan string, 1),
 		udpDataCh:   make(chan UDPDataPacket, 100),
 		udpRequests: make(map[string]UDPRequest),
 	}
+
+	// Log the UDP port
+	log.Printf("UDP transport using address %s", listenAddr)
 
 	// Start the UDP request timeout checker
 	go t.StartUDPRequestTimeoutChecker()
