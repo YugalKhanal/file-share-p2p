@@ -396,19 +396,18 @@ func (t *UDPTransport) handleUDPDataRequest(remoteAddr *net.UDPAddr, fileID stri
 			return
 		}
 
-		// Send response header first
-		header := fmt.Sprintf("DATA_RESP:%s:%s:%d:%d", requestID, fileID, chunkIndex, len(chunkData))
-		_, err = t.udpConn.WriteToUDP([]byte(header), remoteAddr)
-		if err != nil {
-			log.Printf("Failed to send UDP header: %v", err)
-			return
-		}
+		// Format: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<dataLength>||<actual data>
+		// The "||" acts as a delimiter that won't likely appear in metadata
+		headerStr := fmt.Sprintf("DATA_RESP:%s:%s:%d:%d||",
+			requestID, fileID, chunkIndex, len(chunkData))
 
-		// Wait briefly to ensure header is received
-		time.Sleep(10 * time.Millisecond)
+		// Create a combined message
+		fullMsg := make([]byte, len(headerStr)+len(chunkData))
+		copy(fullMsg, []byte(headerStr))
+		copy(fullMsg[len(headerStr):], chunkData)
 
-		// Then send actual data in a separate packet
-		n, err := t.udpConn.WriteToUDP(chunkData, remoteAddr)
+		// Send the combined message
+		n, err := t.udpConn.WriteToUDP(fullMsg, remoteAddr)
 		if err != nil {
 			log.Printf("Failed to send UDP data response: %v", err)
 		} else {
@@ -500,11 +499,19 @@ func (t *UDPTransport) handleUDPMessages() {
 			// Store this peer for future UDP communication
 			t.udpPeers.Store(remoteAddr.String(), remoteAddr)
 
-		} else if strings.HasPrefix(message, "DATA_REQ:") {
-			// Handle data request: DATA_REQ:<requestID>:<fileID>:<chunkIndex>
-			parts := strings.Split(strings.TrimPrefix(message, "DATA_REQ:"), ":")
-			if len(parts) != 3 {
-				log.Printf("Invalid DATA_REQ format from %s: %s", remoteAddr, message)
+		} else if strings.HasPrefix(message, "DATA_RESP:") {
+			// Find the delimiter between header and data
+			delimIndex := strings.Index(message, "||")
+			if delimIndex == -1 {
+				log.Printf("Invalid DATA_RESP format from %s: missing delimiter", remoteAddr)
+				continue
+			}
+
+			// Parse the header
+			header := message[:delimIndex]
+			parts := strings.Split(strings.TrimPrefix(header, "DATA_RESP:"), ":")
+			if len(parts) != 4 {
+				log.Printf("Invalid DATA_RESP header from %s: %s", remoteAddr, header)
 				continue
 			}
 
@@ -512,13 +519,45 @@ func (t *UDPTransport) handleUDPMessages() {
 			fileID := parts[1]
 			chunkIndex, err := strconv.Atoi(parts[2])
 			if err != nil {
-				log.Printf("Invalid chunk index in DATA_REQ from %s: %s", remoteAddr, parts[2])
+				log.Printf("Invalid chunk index in DATA_RESP from %s: %s", remoteAddr, parts[2])
 				continue
 			}
 
-			// Process request in a separate goroutine
-			go t.handleUDPDataRequest(remoteAddr, fileID, chunkIndex, requestID)
+			dataLength, err := strconv.Atoi(parts[3])
+			if err != nil {
+				log.Printf("Invalid data length in DATA_RESP from %s: %v", remoteAddr, dataLength)
+				continue
+			}
 
+			// Extract the actual data part (after the delimiter)
+			chunkData := data[delimIndex+2:]
+
+			log.Printf("Received UDP data response for file %s chunk %d from %s (%d bytes)",
+				fileID, chunkIndex, remoteAddr, len(chunkData))
+
+			// Look up the handler for this response
+			handlerObj, exists := t.udpResponseHandlers.Load(requestID)
+			if !exists {
+				log.Printf("No handler found for UDP response with ID %s", requestID)
+				continue
+			}
+
+			// Call the handler with the data
+			if handler, ok := handlerObj.(func([]byte, error)); ok {
+				// Call the handler with the data
+				handler(chunkData, nil)
+
+				// Clean up after successful response
+				t.udpResponseHandlers.Delete(requestID)
+				t.udpRequestsMu.Lock()
+				delete(t.udpRequests, requestID)
+				t.udpRequestsMu.Unlock()
+
+				log.Printf("Successfully processed data response (%d bytes) for request %s",
+					len(chunkData), requestID)
+			} else {
+				log.Printf("Invalid handler type for UDP response with ID %s", requestID)
+			}
 		} else if strings.HasPrefix(message, "DATA_RESP:") {
 			// Handle data response header: DATA_RESP:<requestID>:<fileID>:<chunkIndex>:<dataLength>
 			parts := strings.Split(strings.TrimPrefix(message, "DATA_RESP:"), ":")

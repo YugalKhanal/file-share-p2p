@@ -121,7 +121,7 @@ func (s *FileServer) handleUDPDataRequest(fileID string, chunkIndex int) ([]byte
 	// Read chunk with retry logic
 	var chunkData []byte
 	var err error
-	for retries := 0; retries < 3; retries++ {
+	for retries := range 3 {
 		log.Printf("Reading chunk %d from file %s (attempt %d/3)",
 			chunkIndex, meta.OriginalPath, retries+1)
 
