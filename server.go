@@ -234,11 +234,14 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 			udpPeers[i], udpPeers[j] = udpPeers[j], udpPeers[i]
 		})
 
-		// Create a channel for receiving the UDP response
+		// Create channels for receiving the UDP response
 		respChan := make(chan []byte, 1)
 		errChan := make(chan error, 1)
+		doneChan := make(chan struct{})
 
-		// Register a handler for UDP responses
+		defer close(doneChan)
+
+		// Get transport
 		transport, ok := s.opts.Transport.(*p2p.TCPTransport)
 		if ok {
 			// Use a unique request ID to track this specific request
@@ -246,10 +249,25 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 
 			// Setup a response handler with better logging
 			transport.RegisterUDPResponseHandler(requestID, func(data []byte, err error) {
+				select {
+				case <-doneChan:
+					return
+				default:
+				}
+
 				if err != nil {
 					log.Printf("UDP download error: %v", err)
 					select {
 					case errChan <- err:
+					default:
+					}
+					return
+				}
+
+				if data == nil || len(data) == 0 {
+					log.Printf("Warning: Received empty UDP data response")
+					select {
+					case errChan <- fmt.Errorf("empty data received"):
 					default:
 					}
 					return
@@ -280,7 +298,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 				log.Printf("Successfully sent UDP request to %s", udpPeer)
 
 				// Wait for response with timeout
-				timeout := 10 * time.Second
+				timeout := 20 * time.Second // Increased timeout
 				select {
 				case data := <-respChan:
 					log.Printf("Received UDP data response: %d bytes", len(data))
@@ -288,7 +306,6 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 					// Write data to file
 					if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
 						log.Printf("Failed to write UDP chunk data: %v", err)
-						log.Printf("Data size: %d, expected chunk size: %d", len(data), chunkSize)
 						continue
 					}
 
