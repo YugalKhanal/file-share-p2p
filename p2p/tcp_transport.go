@@ -132,15 +132,19 @@ func (t *TCPTransport) SetOnPeer(handler func(Peer) error) {
 	t.OnPeer = handler
 }
 
-// Dial implements the Transport interface.
-// Dial implements the Transport interface for TCPTransport
+// Dial implements the Transport interface for TCP connections.
 func (t *TCPTransport) Dial(addr string) error {
 	addrs := strings.Split(addr, "|")
 	log.Printf("Attempting TCP connections to addresses: %v", addrs)
 
 	// Try each address in the list
 	var lastErr error
-	for _, address := range addrs {
+	for i, address := range addrs {
+		// Skip UDP addresses (odd indexes in our format)
+		if i%2 == 1 {
+			continue // Skip UDP addresses when in TCP transport
+		}
+
 		// Skip invalid addresses
 		host, portStr, err := net.SplitHostPort(address)
 		if err != nil {

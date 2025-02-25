@@ -81,8 +81,7 @@ func (t *UDPTransport) SetOnPeer(handler func(Peer) error) {
 	t.OnPeer = handler
 }
 
-// Dial implements the Transport interface.
-// Dial implements the Transport interface for UDPTransport
+// Dial implements the Transport interface for UDP connections.
 func (t *UDPTransport) Dial(addr string) error {
 	// Initialize UDP listener if not already done
 	if t.udpConn == nil {
@@ -99,7 +98,12 @@ func (t *UDPTransport) Dial(addr string) error {
 	var wg sync.WaitGroup
 
 	// Try hole punching for each address
-	for _, address := range addrs {
+	for i, address := range addrs {
+		// Skip TCP addresses (even indexes in our format)
+		if i%2 == 0 {
+			continue // Skip TCP addresses when in UDP transport
+		}
+
 		wg.Add(1)
 		go func(targetAddr string) {
 			defer wg.Done()

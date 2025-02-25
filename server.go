@@ -209,9 +209,12 @@ func getPeerAddress(listenAddr string) (string, error) {
 	tcpPortInt, _ := strconv.Atoi(tcpPort)
 	udpPort := strconv.Itoa(tcpPortInt + 1)
 
-	// Return TCP and UDP addresses in a format that peers can use
-	// Format: publicIP:tcpPort:udpPort|localIP:tcpPort:udpPort
-	return fmt.Sprintf("%s:%s:%s|%s:%s:%s", publicIP, tcpPort, udpPort, localIP, tcpPort, udpPort), nil
+	// Return addresses in a format that can be parsed: publicIP:tcpPort|publicIP:udpPort|localIP:tcpPort|localIP:udpPort
+	return fmt.Sprintf("%s:%s|%s:%s|%s:%s|%s:%s",
+		publicIP, tcpPort,
+		publicIP, udpPort,
+		localIP, tcpPort,
+		localIP, udpPort), nil
 }
 
 func (s *FileServer) refreshPeers(fileID string) error {
