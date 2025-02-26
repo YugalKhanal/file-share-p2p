@@ -38,7 +38,7 @@ func NewPieceManager(numPieces int, hashes []string) *PieceManager {
 		numPieces: numPieces,
 	}
 
-	for i := 0; i < numPieces; i++ {
+	for i := range numPieces {
 		pm.pieces[i] = &PieceInfo{
 			Index:    i,
 			Hash:     hashes[i],
@@ -81,7 +81,6 @@ func (pm *PieceManager) RemovePeer(peerAddr string) {
 	}
 }
 
-// GetNextPieces returns the next n pieces to download, prioritizing rarest pieces
 // GetNextPieces returns the next n pieces to download, prioritizing rarest pieces
 // and distributing load across peers
 func (pm *PieceManager) GetNextPieces(n int) []PieceInfo {

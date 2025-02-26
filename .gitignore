@@ -4,7 +4,7 @@ bin
 shared_files
 downloaded_*
 p2p-*
-largefile
+largefile*
 large-file
 *.sh
 *.pkg

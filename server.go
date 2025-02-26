@@ -224,6 +224,65 @@ func getPeerAddress(listenAddr string) (string, error) {
 		localIP, port), nil
 }
 
+// In server.go, modify the writeAndVerifyChunk function to return a bool indicating success
+func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int) error {
+	if data == nil || len(data) == 0 {
+		return fmt.Errorf("empty chunk data")
+	}
+
+	startOffset := int64(chunkIndex * chunkSize)
+
+	// Verify chunk size
+	if len(data) > chunkSize {
+		return fmt.Errorf("oversized chunk data: %d bytes, max allowed: %d", len(data), chunkSize)
+	}
+
+	// Write chunk with retry
+	for retries := range 3 {
+		written, err := output.WriteAt(data, startOffset)
+		if err != nil {
+			if retries < 2 {
+				time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("write error: %v", err)
+		}
+
+		if written != len(data) {
+			if retries < 2 {
+				continue
+			}
+			return fmt.Errorf("incomplete write: %d of %d bytes", written, len(data))
+		}
+
+		// If we get here, verify the written data by reading it back
+		if retries == 0 {
+			verifyBuf := make([]byte, len(data))
+			_, readErr := output.ReadAt(verifyBuf, startOffset)
+			if readErr != nil {
+				if retries < 2 {
+					time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
+					continue
+				}
+				return fmt.Errorf("verification read error: %v", readErr)
+			}
+
+			// Compare written and read data
+			if !bytes.Equal(data, verifyBuf) {
+				if retries < 2 {
+					time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
+					continue
+				}
+				return fmt.Errorf("data verification failed")
+			}
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("failed to write chunk after retries")
+}
+
 func (s *FileServer) refreshPeers(fileID string) error {
 	return s.connectToAllPeers(fileID)
 }
@@ -329,16 +388,18 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 					// Wait for response with timeout
 					timeout := 10 * time.Second
 					select {
+
 					case data := <-respChan:
-						log.Printf("Received UDP data response: %d bytes", len(data))
+						log.Printf("Received UDP data response: %d bytes for chunk %d", len(data), chunkIndex)
 
 						// Write data to file
 						if err := writeAndVerifyChunk(data, outputFile, chunkIndex, chunkSize); err != nil {
 							log.Printf("Failed to write UDP chunk data: %v", err)
+							lastErr = err
 							continue
 						}
 
-						log.Printf("Successfully downloaded chunk %d via UDP", chunkIndex)
+						log.Printf("Successfully downloaded and verified chunk %d via UDP", chunkIndex)
 						return nil
 
 					case err := <-errChan:
@@ -492,65 +553,6 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	}
 
 	return fmt.Errorf("all peers failed after %d attempts. last error: %v", maxRetries, lastErr)
-}
-
-// In server.go, modify the writeAndVerifyChunk function to return a bool indicating success
-func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int) error {
-	if data == nil || len(data) == 0 {
-		return fmt.Errorf("empty chunk data")
-	}
-
-	startOffset := int64(chunkIndex * chunkSize)
-
-	// Verify chunk size
-	if len(data) > chunkSize {
-		return fmt.Errorf("oversized chunk data: %d bytes, max allowed: %d", len(data), chunkSize)
-	}
-
-	// Write chunk with retry
-	for retries := range 3 {
-		written, err := output.WriteAt(data, startOffset)
-		if err != nil {
-			if retries < 2 {
-				time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
-				continue
-			}
-			return fmt.Errorf("write error: %v", err)
-		}
-
-		if written != len(data) {
-			if retries < 2 {
-				continue
-			}
-			return fmt.Errorf("incomplete write: %d of %d bytes", written, len(data))
-		}
-
-		// If we get here, verify the written data by reading it back
-		if retries == 0 {
-			verifyBuf := make([]byte, len(data))
-			_, readErr := output.ReadAt(verifyBuf, startOffset)
-			if readErr != nil {
-				if retries < 2 {
-					time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
-					continue
-				}
-				return fmt.Errorf("verification read error: %v", readErr)
-			}
-
-			// Compare written and read data
-			if !bytes.Equal(data, verifyBuf) {
-				if retries < 2 {
-					time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
-					continue
-				}
-				return fmt.Errorf("data verification failed")
-			}
-		}
-
-		return nil
-	}
-
-	return fmt.Errorf("failed to write chunk after retries")
 }
 
 // Handle RPC messages
@@ -1110,16 +1112,26 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 	// Create a channel to report completed pieces
 	completedChan := make(chan int, meta.NumChunks)
+	processedPieces := make(map[int]bool)
 
 	// Start a goroutine to update the progress counter
 	go func() {
-		for range completedChan {
+		for pieceIndex := range completedChan {
+			// Check if we've already processed this piece to avoid duplicates
+			if _, alreadyProcessed := processedPieces[pieceIndex]; alreadyProcessed {
+				log.Printf("Ignoring duplicate completion for piece %d", pieceIndex)
+				continue
+			}
+
+			// Mark as processed to avoid duplicates
+			processedPieces[pieceIndex] = true
+
 			progressMutex.Lock()
 			completedPieces++
 			curCompleted := completedPieces
 			progressMutex.Unlock()
 
-			// Log every 10th piece or on 25%, 50%, 75% and 100% completion
+			// Log at appropriate thresholds
 			percentage := float64(curCompleted) / float64(meta.NumChunks) * 100
 			if curCompleted%10 == 0 ||
 				int(percentage) == 25 ||
