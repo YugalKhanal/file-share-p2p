@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -133,7 +134,23 @@ func (pm *PieceManager) MarkPieceStatus(index int, status PieceStatus) {
 	defer pm.mu.Unlock()
 
 	if piece, exists := pm.pieces[index]; exists {
+		oldStatus := piece.Status
 		piece.Status = status
+
+		// Log status changes for debugging
+		if oldStatus != status {
+			statusNames := map[PieceStatus]string{
+				PieceMissing:   "Missing",
+				PieceRequested: "Requested",
+				PieceReceived:  "Received",
+				PieceVerified:  "Verified",
+			}
+
+			log.Printf("Piece %d status changed: %s -> %s",
+				index,
+				statusNames[oldStatus],
+				statusNames[status])
+		}
 	}
 }
 
@@ -142,10 +159,20 @@ func (pm *PieceManager) IsComplete() bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
+	totalPieces := len(pm.pieces)
+	verifiedCount := 0
+
 	for _, piece := range pm.pieces {
 		if piece.Status != PieceVerified {
 			return false
 		}
+		verifiedCount++
 	}
+
+	// Debug logging for when we're close to completion
+	if verifiedCount > 0 && verifiedCount >= totalPieces-5 {
+		log.Printf("Completion check: %d/%d pieces verified", verifiedCount, totalPieces)
+	}
+
 	return true
 }

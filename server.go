@@ -494,6 +494,7 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 	return fmt.Errorf("all peers failed after %d attempts. last error: %v", maxRetries, lastErr)
 }
 
+// In server.go, modify the writeAndVerifyChunk function to return a bool indicating success
 func writeAndVerifyChunk(data []byte, output *os.File, chunkIndex, chunkSize int) error {
 	if data == nil || len(data) == 0 {
 		return fmt.Errorf("empty chunk data")
@@ -1107,6 +1108,31 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	activeDownloads := make(map[int]bool)
 	var activeMutex sync.Mutex
 
+	// Create a channel to report completed pieces
+	completedChan := make(chan int, meta.NumChunks)
+
+	// Start a goroutine to update the progress counter
+	go func() {
+		for range completedChan {
+			progressMutex.Lock()
+			completedPieces++
+			curCompleted := completedPieces
+			progressMutex.Unlock()
+
+			// Log every 10th piece or on 25%, 50%, 75% and 100% completion
+			percentage := float64(curCompleted) / float64(meta.NumChunks) * 100
+			if curCompleted%10 == 0 ||
+				int(percentage) == 25 ||
+				int(percentage) == 50 ||
+				int(percentage) == 75 ||
+				int(percentage) == 100 {
+
+				log.Printf("Download progress update: %d/%d pieces (%.2f%%)",
+					curCompleted, meta.NumChunks, percentage)
+			}
+		}
+	}()
+
 	// Main download loop
 	for !pieceManager.IsComplete() {
 		// Get available peers (both TCP and UDP)
@@ -1143,7 +1169,15 @@ func (s *FileServer) DownloadFile(fileID string) error {
 			activeMutex.Unlock()
 
 			if activeCount == 0 {
-				break
+				// Double check if we're actually complete
+				if pieceManager.IsComplete() {
+					break
+				}
+
+				// If not complete but no pieces to download, wait briefly and try again
+				log.Printf("No pieces to download but download not complete. Waiting briefly...")
+				time.Sleep(2 * time.Second)
+				continue
 			}
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -1170,10 +1204,16 @@ func (s *FileServer) DownloadFile(fileID string) error {
 				// Download the chunk
 				err := s.downloadChunk(fileID, p.Index, meta.ChunkSize, outputFile)
 				if err == nil {
+					// Mark the piece as verified in the pieceManager
 					pieceManager.MarkPieceStatus(p.Index, PieceVerified)
-					progressMutex.Lock()
-					completedPieces++
-					progressMutex.Unlock()
+
+					// Send notification that a piece completed
+					select {
+					case completedChan <- p.Index:
+						// Successfully updated progress
+					default:
+						log.Printf("Warning: Couldn't update progress for piece %d", p.Index)
+					}
 					return
 				}
 
@@ -1189,12 +1229,14 @@ func (s *FileServer) DownloadFile(fileID string) error {
 
 	// Wait for all downloads to complete
 	wg.Wait()
+	close(completedChan)
 
 	// Verify the download was successful
 	if !pieceManager.IsComplete() {
 		return fmt.Errorf("download incomplete - some pieces could not be retrieved")
 	}
 
+	log.Printf("Download completed successfully: %s", outputFileName)
 	return nil
 }
 
